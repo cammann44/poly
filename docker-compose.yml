@@ -1,0 +1,98 @@
+version: '3.8'
+
+services:
+  # Detection Service (Python)
+  detection:
+    build:
+      context: ./detection
+      dockerfile: Dockerfile
+    container_name: poly_detection
+    volumes:
+      - ./config:/app/config:ro
+      - ipc_sockets:/tmp
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - ./config/.env
+    restart: unless-stopped
+    networks:
+      - poly_network
+    depends_on:
+      - execution
+
+  # Decision Engine (Python)
+  decision:
+    build:
+      context: ./decision
+      dockerfile: Dockerfile
+    container_name: poly_decision
+    volumes:
+      - ./config:/app/config:ro
+      - ipc_sockets:/tmp
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - ./config/.env
+    restart: unless-stopped
+    networks:
+      - poly_network
+    depends_on:
+      - detection
+      - execution
+
+  # Execution Service (Rust)
+  execution:
+    build:
+      context: ./execution
+      dockerfile: Dockerfile
+    container_name: poly_execution
+    volumes:
+      - ./config:/app/config:ro
+      - ipc_sockets:/tmp
+    env_file:
+      - ./config/.env
+    restart: unless-stopped
+    networks:
+      - poly_network
+
+  # Monitoring Stack
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: poly_prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - poly_network
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: poly_grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    networks:
+      - poly_network
+
+volumes:
+  ipc_sockets:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  poly_network:
+    driver: bridge

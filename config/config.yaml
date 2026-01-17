@@ -1,0 +1,109 @@
+# Polymarket Copy-Trading Bot Configuration
+
+# Network Configuration
+network:
+  polygon_rpc: "https://polygon-rpc.com"
+  polygon_wss: "wss://polygon.drpc.org"
+
+# Polymarket CLOB Endpoints
+clob:
+  rest_url: "https://clob.polymarket.com"
+  wss_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+# Contract Addresses (Polygon Mainnet)
+contracts:
+  ctf_exchange: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+  conditional_tokens: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+  usdc: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+# MEV Relay (Optional)
+marlin:
+  enabled: false
+  endpoint: "https://bor.txrelay.marlin.org"
+
+# Detection Configuration
+detection:
+  # WebSocket reconnection
+  reconnect_delay_ms: 1000
+  max_reconnect_attempts: 10
+  heartbeat_interval_ms: 30000
+
+  # Signal processing
+  dedup_window_ms: 500
+  min_trade_usd: 10
+
+# Decision Configuration
+decision:
+  # Position sizing strategy: PERCENTAGE | FIXED | ADAPTIVE
+  sizing_strategy: "PERCENTAGE"
+
+  # PERCENTAGE strategy params
+  percentage:
+    base_pct: 10  # Copy 10% of target trade size
+    max_pct: 25   # Cap at 25%
+
+  # FIXED strategy params
+  fixed:
+    amount_usd: 25
+
+  # ADAPTIVE strategy params (scales with confidence)
+  adaptive:
+    min_pct: 5
+    max_pct: 20
+    confidence_weight: 0.5
+
+# Risk Controls
+risk:
+  max_position_usd: 500        # Per-market position limit
+  max_daily_volume_usd: 2000   # Daily trading cap
+  max_slippage_bps: 150        # 1.5% max slippage
+  min_order_usd: 5             # Minimum order size
+  max_order_usd: 200           # Maximum single order
+  cooldown_ms: 1000            # Between orders to same market
+  max_open_positions: 20       # Total open positions limit
+
+# Execution Configuration
+execution:
+  # Order type: GTC | GTD | FOK | IOC
+  default_order_type: "GTC"
+
+  # Submission method: CLOB | MARLIN
+  submission_method: "CLOB"
+
+  # Retry configuration
+  max_retries: 3
+  retry_delay_ms: 100
+
+  # Gas settings (for on-chain fallback)
+  gas_price_gwei: 50
+  gas_limit: 500000
+
+# IPC Configuration
+ipc:
+  detection_socket: "/tmp/poly_detection.sock"
+  decision_socket: "/tmp/poly_decision.sock"
+  execution_socket: "/tmp/poly_execution.sock"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG | INFO | WARNING | ERROR
+  format: "json"
+  output:
+    - console
+    - file
+  file_path: "./logs/poly.log"
+  rotation:
+    max_size_mb: 100
+    backup_count: 5
+
+# Monitoring
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+  health_check_port: 8080
+
+# Paper Trading Mode
+paper_trading:
+  enabled: true  # Set to false for live trading
+  starting_balance_usd: 1000

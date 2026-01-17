@@ -1,0 +1,17 @@
+# Prometheus configuration for Polymarket Copy-Trading Bot
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Tracker metrics (runs on WSL host)
+  - job_name: 'tracker'
+    static_configs:
+      - targets: ['172.29.218.131:9091']
+    metrics_path: '/metrics'
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
