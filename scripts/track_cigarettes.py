@@ -998,7 +998,7 @@ async def run_trades_api(portfolio: Portfolio):
 
     app = web.Application()
     app.router.add_get("/", get_root)
-    app.router.add_get("/metrics", get_metrics)
+    app.router.add_get("/prom", get_metrics)
     app.router.add_get("/trades", get_trades)
     app.router.add_get("/closed", get_closed_trades)
     app.router.add_get("/all", get_all_trades)
