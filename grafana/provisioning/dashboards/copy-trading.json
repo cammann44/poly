@@ -43,10 +43,10 @@
       "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}},
       "gridPos": {"h": 6, "w": 6, "x": 12, "y": 3},
       "id": 12,
-      "options": {"legend": {"displayMode": "list", "placement": "right", "showLegend": true}, "pieType": "pie", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": true}, "tooltip": {"mode": "single", "sort": "none"}},
+      "options": {"legend": {"displayMode": "list", "placement": "right", "showLegend": true, "values": ["value"]}, "pieType": "pie", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^trades$/", "values": false}, "tooltip": {"mode": "single", "sort": "none"}},
       "targets": [{"columns": [{"selector": "category", "text": "category", "type": "string"}, {"selector": "trades", "text": "trades", "type": "number"}], "format": "table", "refId": "A", "source": "url", "type": "json", "url": "https://tracker-production-e869.up.railway.app/categories", "url_options": {"method": "GET"}}],
       "title": "Trades by Category",
-      "transformations": [{"id": "renameByRegex", "options": {"regex": "(.*)", "renamePattern": "$1"}}],
+      "transformations": [{"id": "rowsToFields", "options": {"mappings": [{"fieldName": "category", "handlerKey": "field.name"}, {"fieldName": "trades", "handlerKey": "field.value"}]}}],
       "type": "piechart"
     },
     {
