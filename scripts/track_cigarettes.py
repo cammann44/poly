@@ -1242,11 +1242,17 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         except:
             return iso_timestamp[:16] if iso_timestamp else ""
 
-    def detect_category(market_name: str) -> str:
-        """Detect category from market name keywords."""
-        if not market_name:
+    def detect_category(market_name: str, slug: str = "") -> str:
+        """Detect category from market name keywords and slug patterns."""
+        if not market_name and not slug:
             return "Other"
-        q = market_name.lower()
+        q = (market_name or "").lower()
+        s = (slug or "").lower()
+
+        # Check slug prefixes first (most reliable for sports)
+        if any(s.startswith(p) for p in ["nba-", "nfl-", "mlb-", "nhl-", "cbb-", "cfb-", "mls-", "ufc-", "pga-", "atp-", "wta-"]):
+            return "Sports"
+
         if any(w in q for w in ["trump", "biden", "election", "congress", "senate", "president", "vote", "governor", "republican", "democrat"]):
             return "Politics"
         if any(w in q for w in ["nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "hockey", "sports", "game", "match", "vs.", "spread", "o/u", "patriots", "lakers", "yankees", "cavaliers", "pacers", "pistons", "grizzlies", "spurs", "thunder", "heat", "celtics", "warriors", "bulls", "knicks", "nets", "clippers", "rockets", "mavericks", "suns", "76ers", "bucks", "hawks", "hornets", "magic", "wizards", "raptors", "jazz", "pelicans", "kings", "timberwolves", "blazers", "nuggets", "spartans", "bulldogs", "tigers", "tritons", "hornets", "quakers", "flames", "hurricanes", "devils"]):
@@ -1275,12 +1281,12 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 # BUY - check if position is still open
                 status = "OPEN" if token_id in open_positions else "CLOSED"
 
-            slug = trade.get("slug")
+            slug = trade.get("slug", "")
             market_url = f"https://polymarket.com/event/{slug}" if slug else ""
             market_name = trade.get("market", "Unknown")
             category = trade.get("category")
             if not category or category == "Other":
-                category = detect_category(market_name)
+                category = detect_category(market_name, slug)
             all_trades.append({
                 "timestamp": format_timestamp(trade.get("timestamp", "")),
                 "category": category,
@@ -1339,9 +1345,10 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         cat_stats = {}
         for trade in portfolio.trades:
             market_name = trade.get("market", "")
+            slug = trade.get("slug", "")
             category = trade.get("category")
             if not category or category == "Other":
-                category = detect_category(market_name)
+                category = detect_category(market_name, slug)
             if category not in cat_stats:
                 cat_stats[category] = {"trades": 0, "volume": 0, "pnl": 0}
             cat_stats[category]["trades"] += 1
