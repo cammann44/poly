@@ -11,8 +11,8 @@ COPY scripts/track_cigarettes.py .
 RUN echo "Build timestamp: $(date)" > /app/.buildinfo
 COPY config/ ./config/
 
-# Create logs directory
-RUN mkdir -p logs
+# Copy trade history for state restore
+COPY logs/cigarettes_trades.json ./logs/
 
 # Expose ports
 EXPOSE 9091 9092
