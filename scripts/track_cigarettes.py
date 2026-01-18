@@ -906,13 +906,18 @@ async def run_trades_api(portfolio: Portfolio):
 
     async def get_summary(request):
         """Return portfolio summary."""
+        pv = portfolio.get_portfolio_value()
+        unrealised = pv - STARTING_BALANCE - portfolio.realised_pnl
+        exposure = sum(p["cost"] for p in portfolio.positions.values())
         return web.json_response({
             "balance": round(portfolio.balance, 2),
-            "portfolio_value": round(portfolio.get_portfolio_value(), 2),
+            "portfolio_value": round(pv, 2),
             "realised_pnl": round(portfolio.realised_pnl, 2),
+            "unrealised_pnl": round(unrealised, 2),
             "open_positions": len(portfolio.positions),
             "total_trades": len(portfolio.trades),
-            "daily_volume": round(portfolio.daily_volume, 2)
+            "daily_volume": round(portfolio.daily_volume, 2),
+            "exposure": round(exposure, 2)
         })
 
     async def get_wallets(request):
