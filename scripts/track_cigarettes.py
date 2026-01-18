@@ -99,7 +99,7 @@ EXECUTION_LATENCY = Histogram('poly_execution_latency_ms', 'Latency',
                               buckets=[10, 25, 50, 100, 200, 500])
 
 # ============== LOGGING ==============
-LOG_FILE = Path(__file__).parent.parent / "logs" / "cigarettes_trades.json"
+LOG_FILE = Path(__file__).parent / "logs" / "cigarettes_trades.json"
 LOG_FILE.parent.mkdir(exist_ok=True)
 
 
