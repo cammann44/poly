@@ -6,9 +6,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application - force fresh copy
-ARG CACHEBUST=1
+# Copy application
 COPY scripts/track_cigarettes.py .
+RUN echo "Build timestamp: $(date)" > /app/.buildinfo
 COPY config/ ./config/
 
 # Create logs directory
