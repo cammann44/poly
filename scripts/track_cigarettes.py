@@ -1242,6 +1242,23 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         except:
             return iso_timestamp[:16] if iso_timestamp else ""
 
+    def detect_category(market_name: str) -> str:
+        """Detect category from market name keywords."""
+        if not market_name:
+            return "Other"
+        q = market_name.lower()
+        if any(w in q for w in ["trump", "biden", "election", "congress", "senate", "president", "vote", "governor", "republican", "democrat"]):
+            return "Politics"
+        if any(w in q for w in ["nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "hockey", "sports", "game", "match", "vs.", "spread", "o/u", "patriots", "lakers", "yankees", "cavaliers", "pacers", "pistons", "grizzlies", "spurs", "thunder", "heat", "celtics", "warriors", "bulls", "knicks", "nets", "clippers", "rockets", "mavericks", "suns", "76ers", "bucks", "hawks", "hornets", "magic", "wizards", "raptors", "jazz", "pelicans", "kings", "timberwolves", "blazers", "nuggets", "spartans", "bulldogs", "tigers", "tritons", "hornets", "quakers", "flames", "hurricanes", "devils"]):
+            return "Sports"
+        if any(w in q for w in ["crypto", "bitcoin", "ethereum", "btc", "eth", "solana", "sol"]):
+            return "Crypto"
+        if any(w in q for w in ["fed", "rate", "inflation", "gdp", "economy", "stock", "market", "s&p", "dow", "nasdaq"]):
+            return "Finance"
+        if any(w in q for w in ["ai", "tech", "apple", "google", "microsoft", "openai", "meta"]):
+            return "Tech"
+        return "Other"
+
     async def get_all_trades(request):
         """Return all trades with open/closed status."""
         all_trades = []
@@ -1260,9 +1277,13 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
 
             slug = trade.get("slug")
             market_url = f"https://polymarket.com/event/{slug}" if slug else ""
+            market_name = trade.get("market", "Unknown")
+            category = trade.get("category")
+            if not category or category == "Other":
+                category = detect_category(market_name)
             all_trades.append({
                 "timestamp": format_timestamp(trade.get("timestamp", "")),
-                "category": trade.get("category", "Other"),
+                "category": category,
                 "trader": trade.get("trader", "unknown"),
                 "side": side,
                 "market": trade.get("market", "Unknown"),
@@ -1314,8 +1335,21 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
 
     async def get_categories(request):
         """Return category breakdown for pie chart."""
+        # Aggregate categories from all trades using detect_category
+        cat_stats = {}
+        for trade in portfolio.trades:
+            market_name = trade.get("market", "")
+            category = trade.get("category")
+            if not category or category == "Other":
+                category = detect_category(market_name)
+            if category not in cat_stats:
+                cat_stats[category] = {"trades": 0, "volume": 0, "pnl": 0}
+            cat_stats[category]["trades"] += 1
+            cat_stats[category]["volume"] += trade.get("copy_size", 0)
+            cat_stats[category]["pnl"] += trade.get("trade_pnl", 0)
+
         categories = []
-        for cat, stats in portfolio.category_stats.items():
+        for cat, stats in cat_stats.items():
             categories.append({
                 "category": cat,
                 "trades": stats["trades"],
