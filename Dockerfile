@@ -1,12 +1,15 @@
 FROM python:3.12-slim
 
+# Cache bust arg
+ARG CACHEBUST=1
+
 WORKDIR /app
 
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
+# Copy application - v5 with unrealised_pnl
 COPY scripts/track_cigarettes.py .
 RUN echo "Build timestamp: $(date)" > /app/.buildinfo
 COPY config/ ./config/
