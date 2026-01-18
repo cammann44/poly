@@ -1,41 +1,15 @@
 {
-  "description": "Top Polymarket traders to copy-trade (verified profitable wallets)",
   "wallets": [
-    {
-      "address": "0x9d84ce0306f8551e02efef1680475fc0f1dc1344",
-      "name": "Top Whale #1",
-      "enabled": true,
-      "priority": 1,
-      "copy_ratio": 0.1,
-      "max_copy_usd": 100,
-      "notes": "30-day profit $2.6M, 63% win rate, $967K volume"
-    },
-    {
-      "address": "0xd218e474776403a330142299f7796e8ba32eb5c9",
-      "name": "Top Whale #2",
-      "enabled": true,
-      "priority": 2,
-      "copy_ratio": 0.1,
-      "max_copy_usd": 100,
-      "notes": "30-day profit $958K, 67% win rate"
-    },
-    {
-      "address": "0x1E76C7fFaEf99438a59F9c7f4276dd4f030F528e",
-      "name": "Theo (French Trader)",
-      "enabled": true,
-      "priority": 3,
-      "copy_ratio": 0.05,
-      "max_copy_usd": 50,
-      "notes": "Made $85M on election night 2024"
-    }
+    {"address": "0xd218e474776403a330142299f7796e8ba32eb5c9", "name": "cigarettes", "enabled": true},
+    {"address": "0x6a72f61820b26b1fe4d956e17b6dc2a1ea3033ee", "name": "kch123", "enabled": true, "pnl": 4028573},
+    {"address": "0x006cc834cc092684f1b56626e23bedb3835c16ea", "name": "anon_whale", "enabled": true, "pnl": 2799099},
+    {"address": "0xe90bec87d9ef430f27f9dcfe72c34b76967d5da2", "name": "gmanas", "enabled": true, "pnl": 2377654},
+    {"address": "0x1bc0d88ca86b9049cf05d642e634836d5ddf4429", "name": "212121", "enabled": true, "pnl": 1464982},
+    {"address": "0xdb27bf2ac5d428a9c63dbc914611036855a6c56e", "name": "DrPufferfish", "enabled": true, "pnl": 1402749}
   ],
-  "global_settings": {
-    "min_trade_usd": 50,
-    "track_all_markets": true
-  },
-  "sources": [
-    "https://polymarketanalytics.com/traders",
-    "https://predicting.top/",
-    "https://www.polytrackhq.app/blog/best-polymarket-traders-to-follow-2025"
-  ]
+  "notes": {
+    "source": "Polymarket leaderboard API - monthly top traders",
+    "updated": "2026-01-17",
+    "pnl_usd": "Monthly profit at time of addition"
+  }
 }

@@ -17,9 +17,9 @@
           "unit": "currencyUSD"
         }
       },
-      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 0},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
       "id": 1,
-      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value"},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value", "text": {"titleSize": 12, "valueSize": 28}},
       "targets": [{"expr": "poly_balance_usd", "legendFormat": "Balance", "refId": "A"}],
       "title": "Balance",
       "type": "stat"
@@ -30,15 +30,15 @@
         "defaults": {
           "color": {"mode": "thresholds"},
           "mappings": [],
-          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
           "unit": "short"
         }
       },
-      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 0},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
       "id": 2,
-      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value"},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value", "text": {"titleSize": 12, "valueSize": 28}},
       "targets": [{"expr": "poly_trades_executed_total", "legendFormat": "Trades", "refId": "A"}],
-      "title": "Trades Copied",
+      "title": "Trades",
       "type": "stat"
     },
     {
@@ -51,11 +51,11 @@
           "unit": "currencyUSD"
         }
       },
-      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 0},
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
       "id": 3,
-      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value"},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value", "text": {"titleSize": 12, "valueSize": 28}},
       "targets": [{"expr": "poly_realised_pnl_usd", "legendFormat": "P&L", "refId": "A"}],
-      "title": "Realised P&L",
+      "title": "Realised",
       "type": "stat"
     },
     {
@@ -64,15 +64,49 @@
         "defaults": {
           "color": {"mode": "thresholds"},
           "mappings": [],
-          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0}]},
           "unit": "currencyUSD"
         }
       },
-      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 0},
-      "id": 4,
-      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value"},
-      "targets": [{"expr": "poly_daily_volume_usd", "legendFormat": "Volume", "refId": "A"}],
-      "title": "Daily Volume",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "id": 14,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value", "text": {"titleSize": 12, "valueSize": 28}},
+      "targets": [{"expr": "poly_unrealised_pnl_usd", "legendFormat": "P&L", "refId": "A"}],
+      "title": "Unrealised",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "id": 7,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value", "text": {"titleSize": 12, "valueSize": 28}},
+      "targets": [{"expr": "poly_open_positions", "legendFormat": "Positions", "refId": "A"}],
+      "title": "Open",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}]},
+          "unit": "currencyUSD"
+        }
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "id": 8,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value", "text": {"titleSize": 12, "valueSize": 28}},
+      "targets": [{"expr": "poly_total_exposure_usd", "legendFormat": "Exposure", "refId": "A"}],
+      "title": "Exposure",
       "type": "stat"
     },
     {
@@ -84,14 +118,18 @@
           "mappings": [],
           "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
           "unit": "currencyUSD"
-        }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Cash"}, "properties": [{"id": "color", "value": {"fixedColor": "#3274D9", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "Portfolio"}, "properties": [{"id": "color", "value": {"fixedColor": "#E02F44", "mode": "fixed"}}]}
+        ]
       },
-      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 6},
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 4},
       "id": 5,
-      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "poly_balance_usd", "legendFormat": "Cash Balance", "refId": "A"},
-        {"expr": "poly_portfolio_value_usd", "legendFormat": "Portfolio Value", "refId": "B"}
+        {"expr": "poly_balance_usd", "legendFormat": "Cash", "refId": "A"},
+        {"expr": "poly_portfolio_value_usd", "legendFormat": "Portfolio", "refId": "B"}
       ],
       "title": "Portfolio Over Time",
       "type": "timeseries"
@@ -105,85 +143,23 @@
           "mappings": [],
           "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
           "unit": "short"
-        }
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Trades"}, "properties": [{"id": "color", "value": {"fixedColor": "#3274D9", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "Open"}, "properties": [{"id": "color", "value": {"fixedColor": "#E02F44", "mode": "fixed"}}]},
+          {"matcher": {"id": "byName", "options": "Closed"}, "properties": [{"id": "color", "value": {"fixedColor": "#8AB8FF", "mode": "fixed"}}]}
+        ]
       },
-      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 6},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 4},
       "id": 6,
-      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "poly_trades_executed_total", "legendFormat": "Total Trades", "refId": "A"},
-        {"expr": "poly_open_positions", "legendFormat": "Open Positions", "refId": "B"},
-        {"expr": "poly_closed_trades_total", "legendFormat": "Closed Trades", "refId": "C"}
+        {"expr": "poly_trades_executed_total", "legendFormat": "Trades", "refId": "A"},
+        {"expr": "poly_open_positions", "legendFormat": "Open", "refId": "B"},
+        {"expr": "poly_closed_trades_total", "legendFormat": "Closed", "refId": "C"}
       ],
       "title": "Trading Activity",
       "type": "timeseries"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "thresholds"},
-          "mappings": [],
-          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-          "unit": "short"
-        }
-      },
-      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16},
-      "id": 7,
-      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value"},
-      "targets": [{"expr": "poly_open_positions", "legendFormat": "Positions", "refId": "A"}],
-      "title": "Open Positions",
-      "type": "stat"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "thresholds"},
-          "mappings": [],
-          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-          "unit": "currencyUSD"
-        }
-      },
-      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 16},
-      "id": 8,
-      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value"},
-      "targets": [{"expr": "poly_total_exposure_usd", "legendFormat": "Exposure", "refId": "A"}],
-      "title": "Total Exposure",
-      "type": "stat"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "thresholds"},
-          "mappings": [{"options": {"0": {"color": "red", "index": 0, "text": "DISCONNECTED"}, "1": {"color": "green", "index": 1, "text": "CONNECTED"}}, "type": "value"}],
-          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
-        }
-      },
-      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 16},
-      "id": 9,
-      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value"},
-      "targets": [{"expr": "poly_websocket_connected", "legendFormat": "Status", "refId": "A"}],
-      "title": "Connection Status",
-      "type": "stat"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "thresholds"},
-          "mappings": [],
-          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-          "unit": "short"
-        }
-      },
-      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 16},
-      "id": 10,
-      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value"},
-      "targets": [{"expr": "poly_trades_detected_total", "legendFormat": "Detected", "refId": "A"}],
-      "title": "Trades Detected",
-      "type": "stat"
     },
     {
       "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "infinity"},
@@ -195,14 +171,78 @@
           "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0}]}
         },
         "overrides": [
-          {"matcher": {"id": "byName", "options": "pnl"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "unit", "value": "currencyUSD"}]},
-          {"matcher": {"id": "byName", "options": "pnl_pct"}, "properties": [{"id": "unit", "value": "percent"}]},
-          {"matcher": {"id": "byName", "options": "entry"}, "properties": [{"id": "unit", "value": "currencyUSD"}]},
-          {"matcher": {"id": "byName", "options": "exit"}, "properties": [{"id": "unit", "value": "currencyUSD"}]},
-          {"matcher": {"id": "byName", "options": "size"}, "properties": [{"id": "unit", "value": "currencyUSD"}]}
+          {"matcher": {"id": "byName", "options": "wallet"}, "properties": [{"id": "custom.width", "value": 85}]},
+          {"matcher": {"id": "byName", "options": "trades"}, "properties": [{"id": "custom.width", "value": 50}]},
+          {"matcher": {"id": "byName", "options": "wins"}, "properties": [{"id": "custom.width", "value": 40}]},
+          {"matcher": {"id": "byName", "options": "losses"}, "properties": [{"id": "custom.width", "value": 45}]},
+          {"matcher": {"id": "byName", "options": "win_rate"}, "properties": [{"id": "custom.width", "value": 55}, {"id": "unit", "value": "percentunit"}, {"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0.4}, {"color": "green", "value": 0.5}]}}]},
+          {"matcher": {"id": "byName", "options": "pnl"}, "properties": [{"id": "custom.width", "value": 70}, {"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "unit", "value": "currencyUSD"}]},
+          {"matcher": {"id": "byName", "options": "volume"}, "properties": [{"id": "custom.width", "value": 70}, {"id": "unit", "value": "currencyUSD"}]},
+          {"matcher": {"id": "byName", "options": "open"}, "properties": [{"id": "custom.hidden", "value": true}]},
+          {"matcher": {"id": "byName", "options": "closed"}, "properties": [{"id": "custom.hidden", "value": true}]}
         ]
       },
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 20},
+      "gridPos": {"h": 6, "w": 10, "x": 0, "y": 10},
+      "id": 12,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "trades"}]},
+      "targets": [
+        {
+          "columns": [],
+          "filters": [],
+          "format": "table",
+          "global_query_id": "",
+          "refId": "A",
+          "root_selector": "",
+          "source": "url",
+          "type": "json",
+          "url": "http://172.29.218.131:9092/wallets",
+          "url_options": {"method": "GET"}
+        }
+      ],
+      "title": "Per-Wallet Breakdown",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "currencyUSD"
+        }
+      },
+      "gridPos": {"h": 6, "w": 14, "x": 10, "y": 10},
+      "id": 13,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "poly_wallet_realised_pnl_usd", "legendFormat": "{{wallet}}", "refId": "A"}
+      ],
+      "title": "P&L by Wallet",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "infinity"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {"align": "auto", "cellOptions": {"type": "auto"}, "inspect": false},
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0}]}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "timestamp"}, "properties": [{"id": "custom.width", "value": 125}]},
+          {"matcher": {"id": "byName", "options": "trader"}, "properties": [{"id": "custom.width", "value": 80}]},
+          {"matcher": {"id": "byName", "options": "side"}, "properties": [{"id": "custom.width", "value": 45}]},
+          {"matcher": {"id": "byName", "options": "status"}, "properties": [{"id": "custom.width", "value": 55}, {"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "mappings", "value": [{"options": {"OPEN": {"color": "blue", "index": 0}}, "type": "value"}, {"options": {"CLOSED": {"color": "green", "index": 1}}, "type": "value"}]}]},
+          {"matcher": {"id": "byName", "options": "market"}, "properties": [{"id": "custom.width", "value": 450}, {"id": "links", "value": [{"title": "Open on Polymarket", "url": "${__data.fields.url}", "targetBlank": true}]}]},
+          {"matcher": {"id": "byName", "options": "url"}, "properties": [{"id": "custom.hidden", "value": true}]},
+          {"matcher": {"id": "byName", "options": "price"}, "properties": [{"id": "custom.width", "value": 60}, {"id": "unit", "value": "currencyUSD"}]},
+          {"matcher": {"id": "byName", "options": "size"}, "properties": [{"id": "custom.width", "value": 65}, {"id": "unit", "value": "currencyUSD"}]}
+        ]
+      },
+      "gridPos": {"h": 30, "w": 24, "x": 0, "y": 16},
       "id": 11,
       "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "timestamp"}]},
       "targets": [
@@ -215,11 +255,11 @@
           "root_selector": "",
           "source": "url",
           "type": "json",
-          "url": "http://172.29.218.131:9092/closed",
+          "url": "http://172.29.218.131:9092/all",
           "url_options": {"method": "GET"}
         }
       ],
-      "title": "Closed Trades P&L",
+      "title": "All Trades",
       "type": "table"
     }
   ],
