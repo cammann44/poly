@@ -86,11 +86,11 @@ def detect_category(market_name: str, slug: str = "") -> str:
 
     if any(w in q for w in ["trump", "biden", "election", "congress", "senate", "president", "vote", "governor", "republican", "democrat", "iran", "russia", "ukraine", "china", "strike", "war", "military", "tariff", "sanctions"]):
         return "Politics"
-    if any(w in q for w in ["nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "hockey", "sports", "game", "match", "vs.", "spread", "o/u", "patriots", "lakers", "yankees", "cavaliers", "pacers", "pistons", "grizzlies", "spurs", "thunder", "heat", "celtics", "warriors", "bulls", "knicks", "nets", "clippers", "rockets", "mavericks", "suns", "76ers", "bucks", "hawks", "hornets", "magic", "wizards", "raptors", "jazz", "pelicans", "kings", "timberwolves", "blazers", "nuggets", "spartans", "bulldogs", "tigers", "tritons", "quakers", "flames", "hurricanes", "devils"]):
+    if any(w in q for w in ["nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "hockey", "sports", "game", "match", "vs.", "spread", "o/u", "super bowl", "premier league", "champions league", "world cup", "liverpool", "barcelona", "real madrid", "manchester", "chelsea", "arsenal", "tottenham", "broncos", "rams", "bills", "49ers", "bears", "texans", "chiefs", "eagles", "cowboys", "packers", "patriots", "lakers", "yankees", "cavaliers", "pacers", "pistons", "grizzlies", "spurs", "thunder", "heat", "celtics", "warriors", "bulls", "knicks", "nets", "clippers", "rockets", "mavericks", "suns", "76ers", "bucks", "hawks", "hornets", "magic", "wizards", "raptors", "jazz", "pelicans", "kings", "timberwolves", "blazers", "nuggets", "spartans", "bulldogs", "tigers", "tritons", "quakers", "flames", "hurricanes", "devils"]):
         return "Sports"
     if any(w in q for w in ["crypto", "bitcoin", "ethereum", "btc", "eth", "solana", "sol"]):
         return "Crypto"
-    if any(w in q for w in ["fed", "rate", "inflation", "gdp", "economy", "stock", "market", "s&p", "dow", "nasdaq"]):
+    if any(w in q for w in ["fed", "rate", "inflation", "gdp", "economy", "stock", "market", "s&p", "dow", "nasdaq", "crude oil", "gold", "silver", "commodity", "treasury"]):
         return "Finance"
     if any(w in q for w in ["ai", "tech", "apple", "google", "microsoft", "openai", "meta"]):
         return "Tech"
