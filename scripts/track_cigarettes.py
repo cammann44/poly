@@ -1253,7 +1253,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         if any(s.startswith(p) for p in ["nba-", "nfl-", "mlb-", "nhl-", "cbb-", "cfb-", "mls-", "ufc-", "pga-", "atp-", "wta-"]):
             return "Sports"
 
-        if any(w in q for w in ["trump", "biden", "election", "congress", "senate", "president", "vote", "governor", "republican", "democrat"]):
+        if any(w in q for w in ["trump", "biden", "election", "congress", "senate", "president", "vote", "governor", "republican", "democrat", "iran", "russia", "ukraine", "china", "strike", "war", "military", "tariff", "sanctions"]):
             return "Politics"
         if any(w in q for w in ["nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "hockey", "sports", "game", "match", "vs.", "spread", "o/u", "patriots", "lakers", "yankees", "cavaliers", "pacers", "pistons", "grizzlies", "spurs", "thunder", "heat", "celtics", "warriors", "bulls", "knicks", "nets", "clippers", "rockets", "mavericks", "suns", "76ers", "bucks", "hawks", "hornets", "magic", "wizards", "raptors", "jazz", "pelicans", "kings", "timberwolves", "blazers", "nuggets", "spartans", "bulldogs", "tigers", "tritons", "hornets", "quakers", "flames", "hurricanes", "devils"]):
             return "Sports"
