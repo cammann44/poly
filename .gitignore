@@ -4,8 +4,9 @@
 *.key
 
 # Logs
-logs/
 *.log
+# Keep trade history but ignore other logs
+logs/*.log
 
 # Python
 __pycache__/
