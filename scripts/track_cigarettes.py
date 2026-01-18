@@ -988,7 +988,7 @@ async def run_trades_api(portfolio: Portfolio):
     async def get_root(request):
         return web.json_response({
             "service": "Polymarket Copy Trader",
-            "endpoints": ["/summary", "/positions", "/trades", "/closed", "/wallets", "/risk", "/reconcile", "/metrics"],
+            "endpoints": ["/summary", "/positions", "/trades", "/closed", "/wallets", "/risk", "/reconcile", "/prometheus"],
             "status": "running"
         })
 
