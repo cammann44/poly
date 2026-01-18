@@ -994,8 +994,12 @@ async def run_trades_api(portfolio: Portfolio):
 
     async def get_metrics(request):
         """Prometheus metrics endpoint."""
-        metrics = generate_latest()
-        return web.Response(body=metrics, content_type='text/plain; version=0.0.4; charset=utf-8')
+        try:
+            from prometheus_client import generate_latest
+            metrics = generate_latest()
+            return web.Response(body=metrics, content_type='text/plain; charset=utf-8')
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
 
     app = web.Application()
     app.router.add_get("/", get_root)
