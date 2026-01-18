@@ -21,13 +21,13 @@ from pathlib import Path
 try:
     import aiohttp
     import websockets
-    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server, generate_latest, CONTENT_TYPE_LATEST
 except ImportError:
     import subprocess
     subprocess.check_call(["pip", "install", "aiohttp", "websockets", "prometheus_client", "--user"])
     import aiohttp
     import websockets
-    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server, generate_latest, CONTENT_TYPE_LATEST
 
 # ============== CONFIG ==============
 CONFIG_FILE = Path(__file__).parent.parent / "config" / "wallets.json"
@@ -988,12 +988,18 @@ async def run_trades_api(portfolio: Portfolio):
     async def get_root(request):
         return web.json_response({
             "service": "Polymarket Copy Trader",
-            "endpoints": ["/summary", "/positions", "/trades", "/closed", "/wallets", "/risk", "/reconcile"],
+            "endpoints": ["/summary", "/positions", "/trades", "/closed", "/wallets", "/risk", "/reconcile", "/metrics"],
             "status": "running"
         })
 
+    async def get_metrics(request):
+        """Prometheus metrics endpoint."""
+        metrics = generate_latest()
+        return web.Response(body=metrics, content_type=CONTENT_TYPE_LATEST)
+
     app = web.Application()
     app.router.add_get("/", get_root)
+    app.router.add_get("/metrics", get_metrics)
     app.router.add_get("/trades", get_trades)
     app.router.add_get("/closed", get_closed_trades)
     app.router.add_get("/all", get_all_trades)
