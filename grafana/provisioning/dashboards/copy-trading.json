@@ -39,22 +39,11 @@
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "infinity"},
-      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}},
-      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 3},
-      "id": 12,
-      "options": {"legend": {"displayMode": "list", "placement": "right", "showLegend": true, "values": ["value"]}, "pieType": "pie", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^trades$/", "values": false}, "tooltip": {"mode": "single", "sort": "none"}},
-      "targets": [{"columns": [{"selector": "category", "text": "category", "type": "string"}, {"selector": "trades", "text": "trades", "type": "number"}], "format": "table", "refId": "A", "source": "url", "type": "json", "url": "https://tracker-production-e869.up.railway.app/categories", "url_options": {"method": "GET"}}],
-      "title": "Trades by Category",
-      "transformations": [{"id": "rowsToFields", "options": {"mappings": [{"fieldName": "category", "handlerKey": "field.name"}, {"fieldName": "trades", "handlerKey": "field.value"}]}}],
-      "type": "piechart"
-    },
-    {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {
         "defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "stepAfter", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}
       },
-      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 3},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 3},
       "id": 13,
       "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [

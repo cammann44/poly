@@ -495,6 +495,7 @@ class Portfolio:
                         pos["size"] += copy_size / price if price > 0 else 0
                         pos["entry_price"] = pos["cost"] / pos["size"] if pos["size"] > 0 else price
                     else:
+                        # Count all SELLs as closes
                         if token_id in self.positions:
                             pos = self.positions[token_id]
                             sell_value = min(copy_size, pos["cost"])
@@ -519,6 +520,10 @@ class Portfolio:
                                 del self.positions[token_id]
                                 if token_id in self.position_wallet:
                                     del self.position_wallet[token_id]
+                        else:
+                            # Orphan SELL - position opened before tracking started
+                            # Still count as closed for the wallet
+                            self.wallet_stats[wallet_name]["closed"] += 1
 
             # Calculate open positions per wallet
             for token_id, wallet_name in self.position_wallet.items():
