@@ -154,6 +154,8 @@ class Portfolio:
 
     def _restore_from_log(self):
         """Restore portfolio state from trade log."""
+        print(f"Looking for log file at: {LOG_FILE}")
+        print(f"Log file exists: {LOG_FILE.exists()}")
         if not LOG_FILE.exists():
             return
 
