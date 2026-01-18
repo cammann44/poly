@@ -1,15 +1,15 @@
 FROM python:3.12-slim
 
-# Cache bust arg
-ARG CACHEBUST=1
-
 WORKDIR /app
+
+# Force cache invalidation - v6
+COPY .build-version /tmp/.build-version
 
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application - v5 with unrealised_pnl
+# Copy application with unrealised_pnl fix
 COPY scripts/track_cigarettes.py .
 RUN echo "Build timestamp: $(date)" > /app/.buildinfo
 COPY config/ ./config/
