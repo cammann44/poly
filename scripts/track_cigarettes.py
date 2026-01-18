@@ -22,12 +22,16 @@ try:
     import aiohttp
     import websockets
     from prometheus_client import Counter, Gauge, Histogram, start_http_server, generate_latest, CONTENT_TYPE_LATEST
+    from web3 import Web3
+    from eth_account import Account
 except ImportError:
     import subprocess
-    subprocess.check_call(["pip", "install", "aiohttp", "websockets", "prometheus_client", "--user"])
+    subprocess.check_call(["pip", "install", "aiohttp", "websockets", "prometheus_client", "web3", "eth-account", "--user"])
     import aiohttp
     import websockets
     from prometheus_client import Counter, Gauge, Histogram, start_http_server, generate_latest, CONTENT_TYPE_LATEST
+    from web3 import Web3
+    from eth_account import Account
 
 # ============== CONFIG ==============
 CONFIG_FILE = Path(__file__).parent / "config" / "wallets.json"
@@ -42,6 +46,16 @@ MAX_PORTFOLIO_EXPOSURE = 0.5  # Max 50% of capital in positions
 TRAILING_STOP_LOSS = 0.20  # Exit if position drops 20% from peak
 DAILY_LOSS_LIMIT = 0.10  # Stop trading if daily loss exceeds 10%
 MIN_WALLET_WIN_RATE = 0.40  # Reduce copy ratio if wallet win rate < 40%
+
+# ============== AUTO-WITHDRAWAL CONFIG ==============
+# Set these via environment variables for security
+COLD_WALLET_ADDRESS = os.environ.get("COLD_WALLET_ADDRESS", "")  # Your cold wallet
+HOT_WALLET_PRIVATE_KEY = os.environ.get("HOT_WALLET_PRIVATE_KEY", "")  # Trading wallet private key
+WITHDRAWAL_THRESHOLD = float(os.environ.get("WITHDRAWAL_THRESHOLD", "1000"))  # Withdraw when profits exceed this
+MIN_BALANCE_KEEP = float(os.environ.get("MIN_BALANCE_KEEP", "5000"))  # Always keep this much for trading
+WITHDRAWAL_CHECK_INTERVAL = 3600  # Check every hour (seconds)
+USDC_CONTRACT_POLYGON = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"  # USDC on Polygon
+USDC_DECIMALS = 6
 
 def check_kill_switch() -> bool:
     """Check if kill switch is active. Returns True if trading should STOP."""
@@ -98,9 +112,263 @@ DAILY_PNL = Gauge('poly_daily_pnl_usd', 'Daily PnL')
 EXECUTION_LATENCY = Histogram('poly_execution_latency_ms', 'Latency',
                               buckets=[10, 25, 50, 100, 200, 500])
 
+# Withdrawal metrics
+WITHDRAWALS_TOTAL = Counter('poly_withdrawals_total', 'Total withdrawals made')
+WITHDRAWALS_AMOUNT = Counter('poly_withdrawals_amount_usd', 'Total USD withdrawn')
+LAST_WITHDRAWAL_TIME = Gauge('poly_last_withdrawal_timestamp', 'Last withdrawal timestamp')
+COLD_WALLET_BALANCE = Gauge('poly_cold_wallet_balance_usd', 'Cold wallet USDC balance')
+
+# Performance metrics
+ROI_PERCENT = Gauge('poly_roi_percent', 'Return on investment percentage')
+WIN_RATE = Gauge('poly_win_rate', 'Overall win rate')
+MISSED_TRADES = Counter('poly_missed_trades_total', 'Trades not copied', ['reason'])
+COPY_LATENCY_AVG = Gauge('poly_copy_latency_avg_ms', 'Average copy latency in ms')
+SYSTEM_START_TIME = Gauge('poly_system_start_timestamp', 'System start timestamp')
+CHANGE_24H = Gauge('poly_24h_change_usd', '24 hour portfolio change')
+BEST_TRADER_PNL = Gauge('poly_best_trader_pnl_usd', 'Best trader PnL', ['wallet'])
+WORST_TRADER_PNL = Gauge('poly_worst_trader_pnl_usd', 'Worst trader PnL', ['wallet'])
+
 # ============== LOGGING ==============
 LOG_FILE = Path(__file__).parent / "logs" / "cigarettes_trades.json"
+WITHDRAWAL_LOG_FILE = Path(__file__).parent / "logs" / "withdrawals.json"
 LOG_FILE.parent.mkdir(exist_ok=True)
+
+
+class AutoWithdrawal:
+    """Automatically withdraw profits to cold wallet."""
+
+    def __init__(self):
+        self.enabled = bool(COLD_WALLET_ADDRESS and HOT_WALLET_PRIVATE_KEY)
+        self.w3 = None
+        self.account = None
+        self.usdc_contract = None
+        self.last_withdrawal = 0
+        self.total_withdrawn = 0
+        self.withdrawal_history = []
+
+        if self.enabled:
+            self._setup_web3()
+            self._load_history()
+        else:
+            print("Auto-withdrawal DISABLED - set COLD_WALLET_ADDRESS and HOT_WALLET_PRIVATE_KEY env vars")
+
+    def _setup_web3(self):
+        """Initialize Web3 connection and contracts."""
+        try:
+            self.w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+            if not self.w3.is_connected():
+                print("Failed to connect to Polygon RPC")
+                self.enabled = False
+                return
+
+            self.account = Account.from_key(HOT_WALLET_PRIVATE_KEY)
+            print(f"Auto-withdrawal enabled")
+            print(f"   Hot wallet:  {self.account.address}")
+            print(f"   Cold wallet: {COLD_WALLET_ADDRESS}")
+            print(f"   Threshold:   ${WITHDRAWAL_THRESHOLD:,.0f}")
+            print(f"   Keep min:    ${MIN_BALANCE_KEEP:,.0f}")
+
+            # USDC contract ABI (minimal for transfer)
+            usdc_abi = [
+                {
+                    "constant": True,
+                    "inputs": [{"name": "_owner", "type": "address"}],
+                    "name": "balanceOf",
+                    "outputs": [{"name": "balance", "type": "uint256"}],
+                    "type": "function"
+                },
+                {
+                    "constant": False,
+                    "inputs": [
+                        {"name": "_to", "type": "address"},
+                        {"name": "_value", "type": "uint256"}
+                    ],
+                    "name": "transfer",
+                    "outputs": [{"name": "", "type": "bool"}],
+                    "type": "function"
+                }
+            ]
+            self.usdc_contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(USDC_CONTRACT_POLYGON),
+                abi=usdc_abi
+            )
+        except Exception as e:
+            print(f"Failed to setup Web3: {e}")
+            self.enabled = False
+
+    def _load_history(self):
+        """Load withdrawal history from log."""
+        if WITHDRAWAL_LOG_FILE.exists():
+            try:
+                with open(WITHDRAWAL_LOG_FILE, "r") as f:
+                    for line in f:
+                        if line.strip():
+                            record = json.loads(line)
+                            self.withdrawal_history.append(record)
+                            self.total_withdrawn += record.get("amount_usd", 0)
+                if self.withdrawal_history:
+                    self.last_withdrawal = self.withdrawal_history[-1].get("timestamp", 0)
+                print(f"   Loaded {len(self.withdrawal_history)} previous withdrawals (${self.total_withdrawn:,.2f} total)")
+            except Exception as e:
+                print(f"   Failed to load withdrawal history: {e}")
+
+    def get_usdc_balance(self, address: str) -> float:
+        """Get USDC balance for an address."""
+        if not self.enabled or not self.usdc_contract:
+            return 0
+        try:
+            balance_raw = self.usdc_contract.functions.balanceOf(
+                Web3.to_checksum_address(address)
+            ).call()
+            return balance_raw / (10 ** USDC_DECIMALS)
+        except Exception as e:
+            print(f"Failed to get USDC balance: {e}")
+            return 0
+
+    def get_hot_wallet_balance(self) -> float:
+        """Get USDC balance of hot wallet."""
+        if not self.account:
+            return 0
+        return self.get_usdc_balance(self.account.address)
+
+    def get_cold_wallet_balance(self) -> float:
+        """Get USDC balance of cold wallet."""
+        return self.get_usdc_balance(COLD_WALLET_ADDRESS)
+
+    async def check_and_withdraw(self, realised_pnl: float) -> dict:
+        """Check if withdrawal should happen and execute if so."""
+        if not self.enabled:
+            return {"status": "disabled"}
+
+        # Check if enough time has passed since last withdrawal
+        now = time.time()
+        if now - self.last_withdrawal < WITHDRAWAL_CHECK_INTERVAL:
+            return {"status": "cooldown", "next_check": WITHDRAWAL_CHECK_INTERVAL - (now - self.last_withdrawal)}
+
+        # Get current hot wallet balance
+        hot_balance = self.get_hot_wallet_balance()
+
+        # Calculate withdrawable amount
+        # Withdraw profits above threshold, but keep MIN_BALANCE_KEEP for trading
+        withdrawable = max(0, hot_balance - MIN_BALANCE_KEEP)
+
+        # Only withdraw if we have profits above threshold
+        if realised_pnl < WITHDRAWAL_THRESHOLD:
+            return {
+                "status": "below_threshold",
+                "realised_pnl": realised_pnl,
+                "threshold": WITHDRAWAL_THRESHOLD,
+                "hot_balance": hot_balance
+            }
+
+        if withdrawable < 100:  # Min $100 to withdraw
+            return {
+                "status": "insufficient_withdrawable",
+                "withdrawable": withdrawable,
+                "hot_balance": hot_balance
+            }
+
+        # Calculate amount to withdraw (realised profits or max withdrawable)
+        withdraw_amount = min(realised_pnl, withdrawable)
+
+        # Execute withdrawal
+        result = await self._execute_withdrawal(withdraw_amount)
+        return result
+
+    async def _execute_withdrawal(self, amount_usd: float) -> dict:
+        """Execute USDC transfer to cold wallet."""
+        try:
+            amount_raw = int(amount_usd * (10 ** USDC_DECIMALS))
+
+            # Build transaction
+            nonce = self.w3.eth.get_transaction_count(self.account.address)
+            gas_price = self.w3.eth.gas_price
+
+            txn = self.usdc_contract.functions.transfer(
+                Web3.to_checksum_address(COLD_WALLET_ADDRESS),
+                amount_raw
+            ).build_transaction({
+                'chainId': 137,  # Polygon mainnet
+                'gas': 100000,
+                'gasPrice': gas_price,
+                'nonce': nonce,
+            })
+
+            # Sign and send
+            signed_txn = self.w3.eth.account.sign_transaction(txn, HOT_WALLET_PRIVATE_KEY)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            tx_hash_hex = tx_hash.hex()
+
+            # Wait for confirmation
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+            if receipt['status'] == 1:
+                # Success
+                self.last_withdrawal = time.time()
+                self.total_withdrawn += amount_usd
+
+                record = {
+                    "timestamp": self.last_withdrawal,
+                    "timestamp_iso": datetime.now().isoformat(),
+                    "amount_usd": amount_usd,
+                    "tx_hash": tx_hash_hex,
+                    "to": COLD_WALLET_ADDRESS,
+                    "gas_used": receipt['gasUsed'],
+                    "status": "success"
+                }
+                self.withdrawal_history.append(record)
+                self._log_withdrawal(record)
+
+                # Update metrics
+                WITHDRAWALS_TOTAL.inc()
+                WITHDRAWALS_AMOUNT.inc(amount_usd)
+                LAST_WITHDRAWAL_TIME.set(self.last_withdrawal)
+                COLD_WALLET_BALANCE.set(self.get_cold_wallet_balance())
+
+                print(f"\n{'='*60}")
+                print(f"WITHDRAWAL SUCCESSFUL")
+                print(f"   Amount:  ${amount_usd:,.2f} USDC")
+                print(f"   To:      {COLD_WALLET_ADDRESS}")
+                print(f"   TX:      {tx_hash_hex}")
+                print(f"   Total withdrawn: ${self.total_withdrawn:,.2f}")
+                print(f"{'='*60}\n")
+
+                return {
+                    "status": "success",
+                    "amount": amount_usd,
+                    "tx_hash": tx_hash_hex,
+                    "total_withdrawn": self.total_withdrawn
+                }
+            else:
+                print(f"Withdrawal transaction failed: {tx_hash_hex}")
+                return {"status": "tx_failed", "tx_hash": tx_hash_hex}
+
+        except Exception as e:
+            print(f"Withdrawal error: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _log_withdrawal(self, record: dict):
+        """Log withdrawal to file."""
+        with open(WITHDRAWAL_LOG_FILE, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def get_status(self) -> dict:
+        """Get current withdrawal status."""
+        hot_balance = self.get_hot_wallet_balance() if self.enabled else 0
+        cold_balance = self.get_cold_wallet_balance() if self.enabled else 0
+
+        return {
+            "enabled": self.enabled,
+            "hot_wallet": self.account.address if self.account else None,
+            "cold_wallet": COLD_WALLET_ADDRESS or None,
+            "hot_balance_usd": round(hot_balance, 2),
+            "cold_balance_usd": round(cold_balance, 2),
+            "threshold_usd": WITHDRAWAL_THRESHOLD,
+            "min_keep_usd": MIN_BALANCE_KEEP,
+            "total_withdrawn_usd": round(self.total_withdrawn, 2),
+            "withdrawal_count": len(self.withdrawal_history),
+            "last_withdrawal": datetime.fromtimestamp(self.last_withdrawal).isoformat() if self.last_withdrawal else None
+        }
 
 
 class Portfolio:
@@ -123,6 +391,16 @@ class Portfolio:
         self.position_wallet = {}  # token_id -> wallet_name
         # Track peak value for trailing stop-loss
         self.position_peaks = {}  # token_id -> peak_value
+
+        # Performance tracking
+        self.latencies = []  # Store last 100 latencies for averaging
+        self.total_wins = 0
+        self.total_losses = 0
+        self.value_24h_ago = STARTING_BALANCE  # Updated hourly
+        self.category_stats = {}  # category -> {trades, pnl, volume}
+
+        # Set system start time
+        SYSTEM_START_TIME.set(time.time())
 
         if restore_state:
             self._restore_from_log()
@@ -243,11 +521,13 @@ class Portfolio:
         # Check kill switch
         if check_kill_switch():
             print("🛑 KILL SWITCH ACTIVE - Trade blocked")
+            MISSED_TRADES.labels(reason="kill_switch").inc()
             return False
 
         # Check if trading is paused due to daily loss
         if self.trading_paused:
             print("⏸️ Trading paused - daily loss limit reached")
+            MISSED_TRADES.labels(reason="daily_loss_limit").inc()
             return False
 
         side = trade_data["side"]
@@ -257,6 +537,7 @@ class Portfolio:
         token_id = trade_data.get("token_id", "unknown")
         wallet_name = trade_data.get("trader", "unknown")
         slug = trade_data.get("slug")
+        category = trade_data.get("category", "Other")
 
         # Ensure wallet exists in stats
         if wallet_name not in self.wallet_stats:
@@ -284,6 +565,7 @@ class Portfolio:
                 copy_size = max(0, max_exposure - current_exposure)
                 if copy_size < MIN_COPY_SIZE:
                     print(f"  ❌ Cannot open position - max exposure reached")
+                    MISSED_TRADES.labels(reason="max_exposure").inc()
                     return False
 
         fee = copy_size * 0.001
@@ -293,6 +575,7 @@ class Portfolio:
             cost = copy_size + fee
             if cost > self.balance:
                 print(f"  Insufficient balance: need ${cost:.2f}, have ${self.balance:.2f}")
+                MISSED_TRADES.labels(reason="insufficient_balance").inc()
                 return False
             self.balance -= cost
 
@@ -346,6 +629,7 @@ class Portfolio:
             "timestamp": datetime.now().isoformat(),
             "side": side,
             "market": market,
+            "category": category,
             "token_id": token_id,
             "slug": slug,
             "original_size": original_size,
@@ -400,6 +684,42 @@ class Portfolio:
         if daily_pnl < -STARTING_BALANCE * DAILY_LOSS_LIMIT:
             self.trading_paused = True
             print(f"🚨 DAILY LOSS LIMIT REACHED: ${daily_pnl:+,.2f}")
+
+        # Update performance metrics
+        # Track latency (keep last 100)
+        self.latencies.append(latency)
+        if len(self.latencies) > 100:
+            self.latencies.pop(0)
+        avg_latency = sum(self.latencies) / len(self.latencies)
+        COPY_LATENCY_AVG.set(avg_latency)
+
+        # ROI
+        roi = ((portfolio_value - STARTING_BALANCE) / STARTING_BALANCE) * 100
+        ROI_PERCENT.set(roi)
+
+        # Overall win rate
+        total_wins = sum(s["wins"] for s in self.wallet_stats.values())
+        total_losses = sum(s["losses"] for s in self.wallet_stats.values())
+        overall_win_rate = total_wins / (total_wins + total_losses) if (total_wins + total_losses) > 0 else 0.5
+        WIN_RATE.set(overall_win_rate)
+
+        # 24h change
+        CHANGE_24H.set(portfolio_value - self.value_24h_ago)
+
+        # Best/worst trader
+        if self.wallet_stats:
+            best = max(self.wallet_stats.items(), key=lambda x: x[1]["pnl"])
+            worst = min(self.wallet_stats.items(), key=lambda x: x[1]["pnl"])
+            BEST_TRADER_PNL.labels(wallet=best[0]).set(best[1]["pnl"])
+            WORST_TRADER_PNL.labels(wallet=worst[0]).set(worst[1]["pnl"])
+
+        # Category stats
+        if category not in self.category_stats:
+            self.category_stats[category] = {"trades": 0, "pnl": 0.0, "volume": 0.0}
+        self.category_stats[category]["trades"] += 1
+        self.category_stats[category]["volume"] += copy_size
+        if side == "SELL":
+            self.category_stats[category]["pnl"] += trade_pnl
 
         return True
 
@@ -468,8 +788,9 @@ class Portfolio:
 class CigarettesTracker:
     """Monitor @cigarettes wallet via multiple data sources."""
 
-    def __init__(self, portfolio: Portfolio):
+    def __init__(self, portfolio: Portfolio, auto_withdrawal: AutoWithdrawal = None):
         self.portfolio = portfolio
+        self.auto_withdrawal = auto_withdrawal
         self.running = False
         self.session = None
         self.seen_trades = set()
@@ -499,12 +820,15 @@ class CigarettesTracker:
         print("Monitoring via: WebSocket + On-chain + Data API")
         print("-" * 70 + "\n")
 
-        await asyncio.gather(
+        tasks = [
             self.monitor_websocket(),
             self.monitor_onchain(),
             self.poll_data_api(),
             self.periodic_status()
-        )
+        ]
+        if self.auto_withdrawal and self.auto_withdrawal.enabled:
+            tasks.append(self.periodic_withdrawal_check())
+        await asyncio.gather(*tasks)
 
     async def monitor_websocket(self):
         """Monitor Polymarket WebSocket for real-time trade activity."""
@@ -569,7 +893,7 @@ class CigarettesTracker:
                     print(f"\n⚡ [WS] {side} detected from @{wallet_name}")
 
                     # Get market info
-                    _, market_name, slug = await self.get_token_price(str(token_id))
+                    _, market_name, slug, category = await self.get_token_price(str(token_id))
 
                     trade_data = {
                         "side": side,
@@ -578,7 +902,8 @@ class CigarettesTracker:
                         "market": market_name,
                         "token_id": str(token_id),
                         "trader": wallet_name,
-                        "slug": slug
+                        "slug": slug,
+                        "category": category
                     }
 
                     # Deduplicate with seen_trades
@@ -696,7 +1021,7 @@ class CigarettesTracker:
         TRADES_DETECTED.labels(wallet=wallet_name).inc()
 
         # Fetch real price from Polymarket API
-        price, market_name, slug = await self.get_token_price(str(token_id))
+        price, market_name, slug, category = await self.get_token_price(str(token_id))
 
         print(f"\n{'[BUY]' if side == 'BUY' else '[SELL]'} @{wallet_name} {side}")
         print(f"   Market:   {market_name}")
@@ -712,7 +1037,8 @@ class CigarettesTracker:
             "market": market_name,
             "token_id": str(token_id),
             "trader": wallet_name,
-            "slug": slug
+            "slug": slug,
+            "category": category
         }
 
         success = self.portfolio.copy_trade(trade_data)
@@ -722,13 +1048,13 @@ class CigarettesTracker:
             print(f"   -> COPIED: {side} ${copy_size:.2f} @ ${price:.4f}")
             print(f"   -> Balance: ${self.portfolio.balance:,.2f} | P&L: ${self.portfolio.realised_pnl:+,.2f}")
 
-    async def get_token_price(self, token_id: str) -> tuple[float, str]:
-        """Fetch real price and market name for a token ID."""
+    async def get_token_price(self, token_id: str) -> tuple[float, str, str, str]:
+        """Fetch real price, market name, slug, and category for a token ID."""
         # Check cache first
         if token_id in self.price_cache:
             cached = self.price_cache[token_id]
             if time.time() - cached["time"] < 60:  # Cache for 60 seconds
-                return cached["price"], cached["market"], cached.get("slug")
+                return cached["price"], cached["market"], cached.get("slug"), cached.get("category", "Other")
 
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
         price = 0.5
@@ -755,16 +1081,37 @@ class CigarettesTracker:
         except Exception as e:
             pass
 
-        # Get market name and slug from gamma API
+        # Get market name, slug, and category from gamma API
         slug = None
+        category = "Other"
         try:
             url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
             async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data and len(data) > 0:
-                        market_name = data[0].get("question", market_name)
-                        slug = data[0].get("slug")
+                        market_data = data[0]
+                        market_name = market_data.get("question", market_name)
+                        slug = market_data.get("slug")
+                        # Get category from tags or groupItemTitle
+                        tags = market_data.get("tags", [])
+                        if tags:
+                            category = tags[0].get("label", "Other") if isinstance(tags[0], dict) else tags[0]
+                        elif market_data.get("groupItemTitle"):
+                            category = market_data.get("groupItemTitle")
+                        # Categorize by common keywords if no tags
+                        if category == "Other":
+                            q_lower = market_name.lower()
+                            if any(w in q_lower for w in ["trump", "biden", "election", "congress", "senate", "president", "vote", "governor"]):
+                                category = "Politics"
+                            elif any(w in q_lower for w in ["nfl", "nba", "mlb", "soccer", "football", "basketball", "sports", "game", "match", "win"]):
+                                category = "Sports"
+                            elif any(w in q_lower for w in ["crypto", "bitcoin", "ethereum", "btc", "eth", "price"]):
+                                category = "Crypto"
+                            elif any(w in q_lower for w in ["fed", "rate", "inflation", "gdp", "economy", "stock"]):
+                                category = "Finance"
+                            elif any(w in q_lower for w in ["ai", "tech", "apple", "google", "microsoft"]):
+                                category = "Tech"
         except:
             pass
 
@@ -785,9 +1132,10 @@ class CigarettesTracker:
             "price": price,
             "market": market_name,
             "slug": slug,
+            "category": category,
             "time": time.time()
         }
-        return price, market_name, slug
+        return price, market_name, slug, category
 
     async def get_market_name(self, token_id: str) -> str:
         """Get market name from token ID."""
@@ -835,8 +1183,20 @@ class CigarettesTracker:
             roi = ((pv - STARTING_BALANCE) / STARTING_BALANCE) * 100
             print(f"\n📊 Status: {len(self.portfolio.trades)} trades | Portfolio: ${pv:,.2f} | ROI: {roi:+.2f}% | Block: {self.last_block}\n")
 
+    async def periodic_withdrawal_check(self):
+        """Check for auto-withdrawal periodically."""
+        print("Starting auto-withdrawal monitor...")
+        while self.running:
+            await asyncio.sleep(WITHDRAWAL_CHECK_INTERVAL)  # Check every hour
+            if self.auto_withdrawal and self.auto_withdrawal.enabled:
+                result = await self.auto_withdrawal.check_and_withdraw(self.portfolio.realised_pnl)
+                if result.get("status") == "success":
+                    print(f"Auto-withdrawal completed: ${result.get('amount', 0):,.2f}")
+                elif result.get("status") not in ["disabled", "cooldown", "below_threshold"]:
+                    print(f"Auto-withdrawal check: {result.get('status')}")
 
-async def run_trades_api(portfolio: Portfolio):
+
+async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal = None):
     """Run a simple HTTP API to serve trade data for Grafana."""
     from aiohttp import web
 
@@ -874,6 +1234,14 @@ async def run_trades_api(portfolio: Portfolio):
                     buys_by_token[token_id].pop(0)
         return web.json_response(closed)
 
+    def format_timestamp(iso_timestamp: str) -> str:
+        """Convert ISO timestamp to readable format like 'Jan 18, 14:32'."""
+        try:
+            dt = datetime.fromisoformat(iso_timestamp.replace('Z', '+00:00'))
+            return dt.strftime("%b %d, %H:%M")
+        except:
+            return iso_timestamp[:16] if iso_timestamp else ""
+
     async def get_all_trades(request):
         """Return all trades with open/closed status."""
         all_trades = []
@@ -893,14 +1261,14 @@ async def run_trades_api(portfolio: Portfolio):
             slug = trade.get("slug")
             market_url = f"https://polymarket.com/event/{slug}" if slug else ""
             all_trades.append({
-                "timestamp": trade.get("timestamp", "")[:19],
+                "timestamp": format_timestamp(trade.get("timestamp", "")),
+                "category": trade.get("category", "Other"),
                 "trader": trade.get("trader", "unknown"),
                 "side": side,
-                "status": status,
                 "market": trade.get("market", "Unknown"),
-                "url": market_url,
+                "slug": slug,
                 "price": round(trade.get("price", 0), 4),
-                "size": round(trade.get("copy_size", 0), 2)
+                "copy_size": round(trade.get("copy_size", 0), 2)
             })
         return web.json_response(all_trades)
 
@@ -909,6 +1277,21 @@ async def run_trades_api(portfolio: Portfolio):
         pv = portfolio.get_portfolio_value()
         unrealised = pv - STARTING_BALANCE - portfolio.realised_pnl
         exposure = sum(p["cost"] for p in portfolio.positions.values())
+        roi = ((pv - STARTING_BALANCE) / STARTING_BALANCE) * 100
+        total_wins = sum(s["wins"] for s in portfolio.wallet_stats.values())
+        total_losses = sum(s["losses"] for s in portfolio.wallet_stats.values())
+        win_rate = total_wins / (total_wins + total_losses) if (total_wins + total_losses) > 0 else 0.5
+        avg_latency = sum(portfolio.latencies) / len(portfolio.latencies) if portfolio.latencies else 0
+        uptime_seconds = (datetime.now() - portfolio.start_time).total_seconds()
+
+        # Best/worst trader
+        best_trader = worst_trader = None
+        if portfolio.wallet_stats:
+            best = max(portfolio.wallet_stats.items(), key=lambda x: x[1]["pnl"])
+            worst = min(portfolio.wallet_stats.items(), key=lambda x: x[1]["pnl"])
+            best_trader = {"name": best[0], "pnl": round(best[1]["pnl"], 2)}
+            worst_trader = {"name": worst[0], "pnl": round(worst[1]["pnl"], 2)}
+
         return web.json_response({
             "balance": round(portfolio.balance, 2),
             "portfolio_value": round(pv, 2),
@@ -917,8 +1300,30 @@ async def run_trades_api(portfolio: Portfolio):
             "open_positions": len(portfolio.positions),
             "total_trades": len(portfolio.trades),
             "daily_volume": round(portfolio.daily_volume, 2),
-            "exposure": round(exposure, 2)
+            "exposure": round(exposure, 2),
+            "roi_percent": round(roi, 2),
+            "win_rate": round(win_rate, 2),
+            "wins": total_wins,
+            "losses": total_losses,
+            "avg_latency_ms": round(avg_latency, 1),
+            "uptime_hours": round(uptime_seconds / 3600, 1),
+            "change_24h": round(pv - portfolio.value_24h_ago, 2),
+            "best_trader": best_trader,
+            "worst_trader": worst_trader
         })
+
+    async def get_categories(request):
+        """Return category breakdown for pie chart."""
+        categories = []
+        for cat, stats in portfolio.category_stats.items():
+            categories.append({
+                "category": cat,
+                "trades": stats["trades"],
+                "volume": round(stats["volume"], 2),
+                "pnl": round(stats["pnl"], 2)
+            })
+        categories.sort(key=lambda x: x["trades"], reverse=True)
+        return web.json_response(categories)
 
     async def get_wallets(request):
         """Return per-wallet breakdown with win rates."""
@@ -995,7 +1400,7 @@ async def run_trades_api(portfolio: Portfolio):
     async def get_root(request):
         return web.json_response({
             "service": "Polymarket Copy Trader",
-            "endpoints": ["/summary", "/positions", "/trades", "/closed", "/wallets", "/risk", "/reconcile", "/prometheus"],
+            "endpoints": ["/summary", "/categories", "/trades", "/all", "/closed", "/wallets", "/risk", "/reconcile", "/withdrawal", "/prometheus"],
             "status": "running"
         })
 
@@ -1005,6 +1410,21 @@ async def run_trades_api(portfolio: Portfolio):
         metrics = generate_latest()
         return web.Response(text=metrics.decode('utf-8'), content_type='text/plain')
 
+    async def get_withdrawal_status(request):
+        """Return auto-withdrawal status and history."""
+        if not auto_withdrawal:
+            return web.json_response({"enabled": False, "message": "Auto-withdrawal not configured"})
+        status = auto_withdrawal.get_status()
+        status["recent_withdrawals"] = auto_withdrawal.withdrawal_history[-10:]  # Last 10
+        return web.json_response(status)
+
+    async def trigger_withdrawal(request):
+        """Manually trigger a withdrawal check."""
+        if not auto_withdrawal or not auto_withdrawal.enabled:
+            return web.json_response({"error": "Auto-withdrawal not enabled"}, status=400)
+        result = await auto_withdrawal.check_and_withdraw(portfolio.realised_pnl)
+        return web.json_response(result)
+
     app = web.Application()
     app.router.add_get("/", get_root)
     app.router.add_get("/prometheus", get_metrics)
@@ -1012,9 +1432,12 @@ async def run_trades_api(portfolio: Portfolio):
     app.router.add_get("/closed", get_closed_trades)
     app.router.add_get("/all", get_all_trades)
     app.router.add_get("/summary", get_summary)
+    app.router.add_get("/categories", get_categories)
     app.router.add_get("/wallets", get_wallets)
     app.router.add_get("/risk", get_risk_status)
     app.router.add_get("/reconcile", reconcile_positions)
+    app.router.add_get("/withdrawal", get_withdrawal_status)
+    app.router.add_post("/withdrawal/trigger", trigger_withdrawal)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1036,11 +1459,14 @@ async def main():
     print("Metrics server: http://localhost:9091")
     start_http_server(9091)
 
+    # Initialize auto-withdrawal
+    auto_withdrawal = AutoWithdrawal()
+
     portfolio = Portfolio()
-    tracker = CigarettesTracker(portfolio)
+    tracker = CigarettesTracker(portfolio, auto_withdrawal)
 
     # Start trades API
-    await run_trades_api(portfolio)
+    await run_trades_api(portfolio, auto_withdrawal)
 
     print("Dashboard: http://localhost:3001/d/poly-copy-trade")
 

@@ -8,10 +8,11 @@ COPY provisioning/datasources/datasources.yml /etc/grafana/provisioning/datasour
 COPY provisioning/dashboards/dashboards.yml /etc/grafana/provisioning/dashboards/
 COPY provisioning/dashboards/copy-trading.json /var/lib/grafana/dashboards/
 
-# Environment
-ENV GF_SECURITY_ADMIN_PASSWORD=admin
-ENV GF_AUTH_ANONYMOUS_ENABLED=true
-ENV GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+# Environment - Authentication
+ENV GF_SECURITY_ADMIN_USER=admin
+ENV GF_SECURITY_ADMIN_PASSWORD=cammann
+ENV GF_AUTH_ANONYMOUS_ENABLED=false
+ENV GF_AUTH_DISABLE_LOGIN_FORM=false
 ENV GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/
 
 EXPOSE 3000
