@@ -1,5 +1,8 @@
 FROM grafana/grafana:10.2.2
 
+# Install Infinity datasource plugin for JSON endpoints
+RUN grafana-cli plugins install yesoreyeram-infinity-datasource
+
 # Copy provisioning configs
 COPY provisioning/datasources/datasources.yml /etc/grafana/provisioning/datasources/
 COPY provisioning/dashboards/dashboards.yml /etc/grafana/provisioning/dashboards/

@@ -195,7 +195,7 @@
           "root_selector": "",
           "source": "url",
           "type": "json",
-          "url": "http://172.29.218.131:9092/wallets",
+          "url": "http://tracker.railway.internal:9092/wallets",
           "url_options": {"method": "GET"}
         }
       ],
@@ -255,7 +255,7 @@
           "root_selector": "",
           "source": "url",
           "type": "json",
-          "url": "http://172.29.218.131:9092/all",
+          "url": "http://tracker.railway.internal:9092/all",
           "url_options": {"method": "GET"}
         }
       ],
