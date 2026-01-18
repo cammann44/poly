@@ -997,9 +997,10 @@ async def run_trades_api(portfolio: Portfolio):
         try:
             from prometheus_client import generate_latest
             metrics = generate_latest()
-            return web.Response(body=metrics, content_type='text/plain; charset=utf-8')
+            return web.Response(text=metrics.decode('utf-8'), content_type='text/plain')
         except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
+            import traceback
+            return web.Response(text=f"Error: {str(e)}\n{traceback.format_exc()}", status=500)
 
     app = web.Application()
     app.router.add_get("/", get_root)
