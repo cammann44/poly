@@ -73,6 +73,29 @@ def load_wallets() -> dict:
                     wallets[addr] = w.get("name", addr[:10])
     return wallets
 
+def detect_category(market_name: str, slug: str = "") -> str:
+    """Detect category from market name keywords and slug patterns."""
+    if not market_name and not slug:
+        return "Other"
+    q = (market_name or "").lower()
+    s = (slug or "").lower()
+
+    # Check slug prefixes first (most reliable for sports)
+    if any(s.startswith(p) for p in ["nba-", "nfl-", "mlb-", "nhl-", "cbb-", "cfb-", "mls-", "ufc-", "pga-", "atp-", "wta-"]):
+        return "Sports"
+
+    if any(w in q for w in ["trump", "biden", "election", "congress", "senate", "president", "vote", "governor", "republican", "democrat", "iran", "russia", "ukraine", "china", "strike", "war", "military", "tariff", "sanctions"]):
+        return "Politics"
+    if any(w in q for w in ["nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "hockey", "sports", "game", "match", "vs.", "spread", "o/u", "patriots", "lakers", "yankees", "cavaliers", "pacers", "pistons", "grizzlies", "spurs", "thunder", "heat", "celtics", "warriors", "bulls", "knicks", "nets", "clippers", "rockets", "mavericks", "suns", "76ers", "bucks", "hawks", "hornets", "magic", "wizards", "raptors", "jazz", "pelicans", "kings", "timberwolves", "blazers", "nuggets", "spartans", "bulldogs", "tigers", "tritons", "quakers", "flames", "hurricanes", "devils"]):
+        return "Sports"
+    if any(w in q for w in ["crypto", "bitcoin", "ethereum", "btc", "eth", "solana", "sol"]):
+        return "Crypto"
+    if any(w in q for w in ["fed", "rate", "inflation", "gdp", "economy", "stock", "market", "s&p", "dow", "nasdaq"]):
+        return "Finance"
+    if any(w in q for w in ["ai", "tech", "apple", "google", "microsoft", "openai", "meta"]):
+        return "Tech"
+    return "Other"
+
 TRACKED_WALLETS = load_wallets()
 
 # ============== ENDPOINTS ==============
@@ -1083,7 +1106,7 @@ class CigarettesTracker:
 
         # Get market name, slug, and category from gamma API
         slug = None
-        category = "Other"
+        category = None
         try:
             url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
             async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -1092,28 +1115,34 @@ class CigarettesTracker:
                     if data and len(data) > 0:
                         market_data = data[0]
                         market_name = market_data.get("question", market_name)
-                        slug = market_data.get("slug")
-                        # Get category from tags or groupItemTitle
-                        tags = market_data.get("tags", [])
-                        if tags:
-                            category = tags[0].get("label", "Other") if isinstance(tags[0], dict) else tags[0]
+                        slug = market_data.get("slug", "")
+
+                        # Try to get category from API (multiple sources)
+                        # 1. Direct category field
+                        if market_data.get("category"):
+                            category = market_data["category"]
+                        # 2. Tags
+                        elif market_data.get("tags"):
+                            tags = market_data["tags"]
+                            category = tags[0].get("label") if isinstance(tags[0], dict) else tags[0]
+                        # 3. Events category or series title
+                        elif market_data.get("events"):
+                            event = market_data["events"][0]
+                            if event.get("category"):
+                                category = event["category"]
+                            elif event.get("series"):
+                                series_title = event["series"][0].get("title", "").lower()
+                                if any(s in series_title for s in ["nba", "nfl", "mlb", "nhl", "ufc", "pga", "tennis", "soccer", "football"]):
+                                    category = "Sports"
+                        # 4. groupItemTitle
                         elif market_data.get("groupItemTitle"):
-                            category = market_data.get("groupItemTitle")
-                        # Categorize by common keywords if no tags
-                        if category == "Other":
-                            q_lower = market_name.lower()
-                            if any(w in q_lower for w in ["trump", "biden", "election", "congress", "senate", "president", "vote", "governor"]):
-                                category = "Politics"
-                            elif any(w in q_lower for w in ["nfl", "nba", "mlb", "soccer", "football", "basketball", "sports", "game", "match", "win"]):
-                                category = "Sports"
-                            elif any(w in q_lower for w in ["crypto", "bitcoin", "ethereum", "btc", "eth", "price"]):
-                                category = "Crypto"
-                            elif any(w in q_lower for w in ["fed", "rate", "inflation", "gdp", "economy", "stock"]):
-                                category = "Finance"
-                            elif any(w in q_lower for w in ["ai", "tech", "apple", "google", "microsoft"]):
-                                category = "Tech"
+                            category = market_data["groupItemTitle"]
         except:
             pass
+
+        # If no category from API, use detect_category helper
+        if not category or category == "Other":
+            category = detect_category(market_name, slug)
 
         # Fallback to CLOB API if gamma didn't work
         if not slug and condition_id:
@@ -1241,29 +1270,6 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             return dt.strftime("%b %d, %H:%M")
         except:
             return iso_timestamp[:16] if iso_timestamp else ""
-
-    def detect_category(market_name: str, slug: str = "") -> str:
-        """Detect category from market name keywords and slug patterns."""
-        if not market_name and not slug:
-            return "Other"
-        q = (market_name or "").lower()
-        s = (slug or "").lower()
-
-        # Check slug prefixes first (most reliable for sports)
-        if any(s.startswith(p) for p in ["nba-", "nfl-", "mlb-", "nhl-", "cbb-", "cfb-", "mls-", "ufc-", "pga-", "atp-", "wta-"]):
-            return "Sports"
-
-        if any(w in q for w in ["trump", "biden", "election", "congress", "senate", "president", "vote", "governor", "republican", "democrat", "iran", "russia", "ukraine", "china", "strike", "war", "military", "tariff", "sanctions"]):
-            return "Politics"
-        if any(w in q for w in ["nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "hockey", "sports", "game", "match", "vs.", "spread", "o/u", "patriots", "lakers", "yankees", "cavaliers", "pacers", "pistons", "grizzlies", "spurs", "thunder", "heat", "celtics", "warriors", "bulls", "knicks", "nets", "clippers", "rockets", "mavericks", "suns", "76ers", "bucks", "hawks", "hornets", "magic", "wizards", "raptors", "jazz", "pelicans", "kings", "timberwolves", "blazers", "nuggets", "spartans", "bulldogs", "tigers", "tritons", "hornets", "quakers", "flames", "hurricanes", "devils"]):
-            return "Sports"
-        if any(w in q for w in ["crypto", "bitcoin", "ethereum", "btc", "eth", "solana", "sol"]):
-            return "Crypto"
-        if any(w in q for w in ["fed", "rate", "inflation", "gdp", "economy", "stock", "market", "s&p", "dow", "nasdaq"]):
-            return "Finance"
-        if any(w in q for w in ["ai", "tech", "apple", "google", "microsoft", "openai", "meta"]):
-            return "Tech"
-        return "Other"
 
     async def get_all_trades(request):
         """Return all trades with open/closed status."""
