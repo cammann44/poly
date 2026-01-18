@@ -30,8 +30,8 @@ except ImportError:
     from prometheus_client import Counter, Gauge, Histogram, start_http_server, generate_latest, CONTENT_TYPE_LATEST
 
 # ============== CONFIG ==============
-CONFIG_FILE = Path(__file__).parent.parent / "config" / "wallets.json"
-KILL_SWITCH_FILE = Path(__file__).parent.parent / "config" / "KILL_SWITCH"
+CONFIG_FILE = Path(__file__).parent / "config" / "wallets.json"
+KILL_SWITCH_FILE = Path(__file__).parent / "config" / "KILL_SWITCH"
 STARTING_BALANCE = 25000  # $25k
 COPY_RATIO = 0.1  # Copy 10% of their trade size
 MAX_COPY_SIZE = 500  # Max $500 per trade
