@@ -994,11 +994,13 @@ async def run_trades_api(portfolio: Portfolio):
 
     async def get_metrics(request):
         """Prometheus metrics endpoint."""
-        return web.Response(text="test metrics", content_type='text/plain')
+        from prometheus_client import generate_latest
+        metrics = generate_latest()
+        return web.Response(text=metrics.decode('utf-8'), content_type='text/plain')
 
     app = web.Application()
     app.router.add_get("/", get_root)
-    app.router.add_get("/prom", get_metrics)
+    app.router.add_get("/metrics", get_metrics)
     app.router.add_get("/trades", get_trades)
     app.router.add_get("/closed", get_closed_trades)
     app.router.add_get("/all", get_all_trades)
