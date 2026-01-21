@@ -2221,6 +2221,109 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "failed": failed
         })
 
+    async def resolve_ended_markets(request):
+        """Check for resolved markets and close positions with final P&L."""
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        resolved = 0
+        wins = 0
+        losses = 0
+        failed = 0
+        total_pnl = 0
+
+        # Get all open positions
+        positions_to_check = list(portfolio.positions.items())
+
+        async with aiohttp.ClientSession() as session:
+            for token_id, pos in positions_to_check:
+                try:
+                    url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data and len(data) > 0:
+                                market = data[0]
+                                is_closed = market.get("closed", False)
+                                accepting_orders = market.get("acceptingOrders", True)
+
+                                # Market is resolved if closed and not accepting orders
+                                if is_closed and not accepting_orders:
+                                    # Get resolution price for our token
+                                    clob_tokens = json.loads(market.get("clobTokenIds", "[]"))
+                                    outcome_prices = json.loads(market.get("outcomePrices", "[]"))
+
+                                    if token_id in clob_tokens:
+                                        idx = clob_tokens.index(token_id)
+                                        if idx < len(outcome_prices):
+                                            resolution_price = float(outcome_prices[idx])
+                                            entry_price = pos.get("entry_price", 0)
+                                            shares = pos.get("size", 0)
+
+                                            # Calculate P&L
+                                            pnl = (resolution_price - entry_price) * shares
+
+                                            # Create a SELL trade to record the close
+                                            sell_trade = {
+                                                "timestamp": datetime.now().isoformat(),
+                                                "wallet": pos.get("wallet", "unknown"),
+                                                "trader": portfolio.position_wallet.get(token_id, "unknown"),
+                                                "side": "SELL",
+                                                "token_id": token_id,
+                                                "market": pos.get("market", market.get("question", "Unknown")),
+                                                "slug": market.get("slug", ""),
+                                                "price": resolution_price,
+                                                "size": pos.get("original_size", 0),
+                                                "copy_size": pos.get("cost", 0),
+                                                "trade_pnl": pnl,
+                                                "outcome": "RESOLVED",
+                                                "resolution": "WIN" if resolution_price >= 0.5 else "LOSS"
+                                            }
+                                            portfolio.trades.append(sell_trade)
+
+                                            # Update realised P&L
+                                            portfolio.realised_pnl += pnl
+                                            total_pnl += pnl
+
+                                            # Remove from open positions
+                                            del portfolio.positions[token_id]
+                                            if token_id in portfolio.position_prices:
+                                                del portfolio.position_prices[token_id]
+                                            if token_id in portfolio.position_price_times:
+                                                del portfolio.position_price_times[token_id]
+
+                                            resolved += 1
+                                            if resolution_price >= 0.5:
+                                                wins += 1
+                                            else:
+                                                losses += 1
+                except Exception as e:
+                    failed += 1
+
+                await asyncio.sleep(0.1)  # Rate limit
+
+        # Update balance with realised P&L
+        portfolio.balance += total_pnl
+
+        # Rewrite log file
+        with open(LOG_FILE, 'w') as f:
+            for t in portfolio.trades:
+                f.write(json.dumps(t) + "\n")
+
+        # Update metrics
+        REALISED_PNL.set(portfolio.realised_pnl)
+        BALANCE.set(portfolio.balance)
+        OPEN_POSITIONS.set(len(portfolio.positions))
+
+        return web.json_response({
+            "status": "success",
+            "positions_checked": len(positions_to_check),
+            "resolved": resolved,
+            "wins": wins,
+            "losses": losses,
+            "total_pnl": round(total_pnl, 2),
+            "failed": failed,
+            "positions_remaining": len(portfolio.positions)
+        })
+
     async def debug_positions(request):
         """Debug endpoint to verify position prices and P&L calculations."""
         positions_data = []
@@ -2434,6 +2537,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_post("/backfill-prices", update_trade_prices)
     app.router.add_post("/remove-fake-prices", remove_fake_prices)
     app.router.add_post("/backfill-outcomes", backfill_outcomes)
+    app.router.add_post("/resolve", resolve_ended_markets)
     app.router.add_get("/reconcile", reconcile_positions)
     app.router.add_post("/update-prices", trigger_price_update)
     app.router.add_get("/withdrawal", get_withdrawal_status)
