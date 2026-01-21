@@ -1747,6 +1747,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "P&L ($)",
             "P&L %",
             "Price Age (min)",
+            "Token ID",
             "Polymarket URL"
         ])
 
@@ -1772,6 +1773,8 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                         entry_price = t.get("price")
                         if not outcome:
                             outcome = t.get("outcome", "")
+                        if not slug:
+                            slug = t.get("slug", "")
                         break
                 current_price = trade_price  # Exit price
             else:
@@ -1806,8 +1809,8 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 price_age_sec = time.time() - portfolio.position_price_times[token_id]
                 price_age_min = round(price_age_sec / 60, 1)
 
-            # Polymarket URL
-            poly_url = f"https://polymarket.com/event/{slug}" if slug else ""
+            # Polymarket URL - use /market/ which redirects correctly
+            poly_url = f"https://polymarket.com/market/{slug}" if slug else ""
 
             writer.writerow([
                 trade.get("timestamp", ""),
@@ -1823,6 +1826,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 round(pnl, 2),
                 round(pnl_pct, 1),
                 price_age_min,
+                token_id,
                 poly_url
             ])
 
