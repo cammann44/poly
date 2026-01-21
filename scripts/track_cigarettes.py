@@ -2144,15 +2144,23 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         })
 
     async def backfill_outcomes(request):
-        """Backfill correct YES/NO outcomes and option names for existing trades by querying gamma API."""
+        """Backfill outcomes, option names, slugs, and market names for existing trades."""
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
         updated = 0
         failed = 0
 
-        # Get unique token_ids that need outcome lookup
+        # Get unique token_ids that need data lookup
         tokens_to_lookup = set()
         for trade in portfolio.trades:
-            if not trade.get("outcome") or trade.get("outcome") in ["YES", "NO"] or not trade.get("option_name"):
+            # Check if any field is missing
+            needs_update = (
+                not trade.get("outcome") or
+                trade.get("outcome") in ["YES", "NO"] or
+                not trade.get("option_name") or
+                not trade.get("slug") or
+                (trade.get("market", "").startswith("Token "))
+            )
+            if needs_update:
                 tokens_to_lookup.add(trade.get("token_id"))
 
         async with aiohttp.ClientSession() as session:
@@ -2169,6 +2177,8 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                                 clob_tokens = market_data.get("clobTokenIds", [])
                                 outcomes_list = market_data.get("outcomes", ["Yes", "No"])
                                 option_name = market_data.get("groupItemTitle")  # e.g., "SRZP"
+                                slug = market_data.get("slug", "")
+                                market_name = market_data.get("question", "")
 
                                 outcome = None
                                 if token_id in clob_tokens:
@@ -2183,6 +2193,10 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                                             trade["outcome"] = outcome
                                         if option_name:
                                             trade["option_name"] = option_name
+                                        if slug:
+                                            trade["slug"] = slug
+                                        if market_name and (not trade.get("market") or trade.get("market", "").startswith("Token ")):
+                                            trade["market"] = market_name
                                         updated += 1
                 except:
                     failed += 1
