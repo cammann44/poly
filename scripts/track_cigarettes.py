@@ -36,13 +36,13 @@ except ImportError:
 # ============== CONFIG ==============
 CONFIG_FILE = Path(__file__).parent / "config" / "wallets.json"
 KILL_SWITCH_FILE = Path(__file__).parent / "config" / "KILL_SWITCH"
-STARTING_BALANCE = 25000  # $25k
+STARTING_BALANCE = 75000  # $75k
 COPY_RATIO = 0.1  # Copy 10% of their trade size
 MAX_COPY_SIZE = 500  # Max $500 per trade
 MIN_COPY_SIZE = 10  # Min $10 per trade
 
 # ============== RISK CONTROLS ==============
-MAX_PORTFOLIO_EXPOSURE = 0.5  # Max 50% of capital in positions
+MAX_PORTFOLIO_EXPOSURE = 1.0  # Max 100% of capital in positions
 TRAILING_STOP_LOSS = 0.20  # Exit if position drops 20% from peak
 DAILY_LOSS_LIMIT = 0.10  # Stop trading if daily loss exceeds 10%
 MIN_WALLET_WIN_RATE = 0.40  # Reduce copy ratio if wallet win rate < 40%
@@ -99,7 +99,7 @@ def detect_category(market_name: str, slug: str = "") -> str:
 TRACKED_WALLETS = load_wallets()
 
 # ============== ENDPOINTS ==============
-POLYGON_RPC = "https://polygon-rpc.com"
+POLYGON_RPC = "https://rpc.ankr.com/polygon"
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 POLYMARKET_DATA = "https://data-api.polymarket.com"
 CLOB_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -152,9 +152,17 @@ BEST_TRADER_PNL = Gauge('poly_best_trader_pnl_usd', 'Best trader PnL', ['wallet'
 WORST_TRADER_PNL = Gauge('poly_worst_trader_pnl_usd', 'Worst trader PnL', ['wallet'])
 
 # ============== LOGGING ==============
-LOG_FILE = Path(__file__).parent / "logs" / "cigarettes_trades.json"
-WITHDRAWAL_LOG_FILE = Path(__file__).parent / "logs" / "withdrawals.json"
-LOG_FILE.parent.mkdir(exist_ok=True)
+# Use Railway volume if available, fallback to local
+VOLUME_PATH = Path("/app/data")
+if VOLUME_PATH.exists():
+    LOG_FILE = VOLUME_PATH / "cigarettes_trades.json"
+    WITHDRAWAL_LOG_FILE = VOLUME_PATH / "withdrawals.json"
+    MISSED_TRADES_FILE = VOLUME_PATH / "missed_trades.json"
+else:
+    LOG_FILE = Path(__file__).parent / "logs" / "cigarettes_trades.json"
+    WITHDRAWAL_LOG_FILE = Path(__file__).parent / "logs" / "withdrawals.json"
+    MISSED_TRADES_FILE = Path(__file__).parent / "logs" / "missed_trades.json"
+    LOG_FILE.parent.mkdir(exist_ok=True)
 
 
 class AutoWithdrawal:
@@ -422,6 +430,16 @@ class Portfolio:
         self.value_24h_ago = STARTING_BALANCE  # Updated hourly
         self.category_stats = {}  # category -> {trades, pnl, volume}
 
+        # Missed trades tracking
+        self.missed_trades = []  # Store trades blocked by limits
+
+        # Daily P&L tracking: date_str -> {pnl, trades, volume, wins, losses}
+        self.daily_pnl = {}
+
+        # Live price tracking for unrealised P&L
+        self.position_prices = {}  # token_id -> current_price
+        self.last_price_update = 0
+
         # Set system start time
         SYSTEM_START_TIME.set(time.time())
 
@@ -433,7 +451,7 @@ class Portfolio:
         portfolio_value = self.balance + exposure
         PORTFOLIO_VALUE.set(portfolio_value)
         REALISED_PNL.set(self.realised_pnl)
-        UNREALISED_PNL.set(portfolio_value - STARTING_BALANCE - self.realised_pnl)
+        UNREALISED_PNL.set(self.get_unrealised_pnl())  # Will be 0 until prices fetched
         DAILY_VOLUME.set(self.daily_volume)
         OPEN_POSITIONS.set(len(self.positions))
         TOTAL_EXPOSURE.set(exposure)
@@ -457,6 +475,15 @@ class Portfolio:
         """Restore portfolio state from trade log."""
         print(f"Looking for log file at: {LOG_FILE}")
         print(f"Log file exists: {LOG_FILE.exists()}")
+
+        # Seed volume with bundled log if volume is empty
+        if VOLUME_PATH.exists() and not LOG_FILE.exists():
+            bundled_log = Path(__file__).parent / "logs" / "cigarettes_trades.json"
+            if bundled_log.exists():
+                print(f"Seeding volume from bundled log: {bundled_log}")
+                import shutil
+                shutil.copy(bundled_log, LOG_FILE)
+
         if not LOG_FILE.exists():
             return
 
@@ -530,6 +557,27 @@ class Portfolio:
                 if wallet_name in self.wallet_stats:
                     self.wallet_stats[wallet_name]["open"] += 1
 
+            # Rebuild daily P&L from trade history
+            for trade in self.trades:
+                ts = trade.get("timestamp", "")
+                if ts:
+                    try:
+                        trade_date = ts[:10]  # Extract YYYY-MM-DD
+                        if trade_date not in self.daily_pnl:
+                            self.daily_pnl[trade_date] = {"pnl": 0.0, "trades": 0, "volume": 0.0, "wins": 0, "losses": 0}
+                        self.daily_pnl[trade_date]["trades"] += 1
+                        self.daily_pnl[trade_date]["volume"] += trade.get("copy_size", 0)
+                        trade_pnl = trade.get("trade_pnl", 0)
+                        if trade["side"] == "SELL":
+                            self.daily_pnl[trade_date]["pnl"] += trade_pnl
+                            if trade_pnl >= 0:
+                                self.daily_pnl[trade_date]["wins"] += 1
+                            else:
+                                self.daily_pnl[trade_date]["losses"] += 1
+                    except:
+                        pass
+            print(f"   📅 Rebuilt daily P&L for {len(self.daily_pnl)} days")
+
             # Calculate final balance
             total_invested = sum(t.get("copy_size", 0) * 1.001 for t in self.trades if t["side"] == "BUY")
             total_returned = sum(t.get("copy_size", 0) * 0.999 for t in self.trades if t["side"] == "SELL")
@@ -541,6 +589,17 @@ class Portfolio:
             print(f"   💵 Realised P&L: ${self.realised_pnl:+,.2f}")
         except Exception as e:
             print(f"   ⚠ Failed to restore state: {e}")
+
+        # Restore missed trades
+        if MISSED_TRADES_FILE.exists():
+            try:
+                with open(MISSED_TRADES_FILE, "r") as f:
+                    for line in f:
+                        if line.strip():
+                            self.missed_trades.append(json.loads(line))
+                print(f"   📊 Restored {len(self.missed_trades)} missed trades")
+            except Exception as e:
+                print(f"   ⚠ Failed to restore missed trades: {e}")
 
     def copy_trade(self, trade_data: dict) -> bool:
         """Copy a real trade from a tracked wallet."""
@@ -560,26 +619,52 @@ class Portfolio:
 
         side = trade_data["side"]
         original_size = trade_data["size"]
-        price = trade_data["price"]
+        price = trade_data.get("price")
         market = trade_data["market"]
         token_id = trade_data.get("token_id", "unknown")
         wallet_name = trade_data.get("trader", "unknown")
         slug = trade_data.get("slug")
         category = trade_data.get("category", "Other")
 
+        # Validate price - never use fake/invalid prices
+        if price is None or price <= 0 or price > 1:
+            print(f"⚠ Rejecting trade - invalid price: {price}")
+            MISSED_TRADES.labels(reason="invalid_price").inc()
+            return False
+
         # Ensure wallet exists in stats
         if wallet_name not in self.wallet_stats:
             self.wallet_stats[wallet_name] = {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
 
-        # Calculate copy size with wallet win-rate adjustment
+        # Calculate copy size with smart sizing based on trader win rate
         base_ratio = COPY_RATIO
         stats = self.wallet_stats[wallet_name]
         total_closed = stats["wins"] + stats["losses"]
-        if total_closed >= 5:  # Need at least 5 trades for win rate
+
+        if total_closed >= 3:  # Need at least 3 trades for win rate
             win_rate = stats["wins"] / total_closed
-            if win_rate < MIN_WALLET_WIN_RATE:
-                base_ratio *= 0.5  # Reduce copy ratio for underperforming wallets
-                print(f"  ⚠ {wallet_name} win rate {win_rate:.0%} < {MIN_WALLET_WIN_RATE:.0%}, reducing copy ratio")
+
+            # Tiered multiplier based on win rate
+            if win_rate >= 0.70:
+                multiplier = 1.5  # Star performer: 15% copy
+            elif win_rate >= 0.60:
+                multiplier = 1.25  # Good performer: 12.5% copy
+            elif win_rate >= 0.50:
+                multiplier = 1.0  # Average: 10% copy
+            elif win_rate >= 0.40:
+                multiplier = 0.7  # Below average: 7% copy
+            else:
+                multiplier = 0.4  # Poor performer: 4% copy
+
+            # Confidence factor: scale up as we get more data (full confidence at 10+ trades)
+            confidence = min(1.0, total_closed / 10)
+            # Blend towards 1.0 with lower confidence
+            adjusted_multiplier = 1.0 + (multiplier - 1.0) * confidence
+
+            base_ratio *= adjusted_multiplier
+
+            if adjusted_multiplier != 1.0:
+                print(f"  📊 {wallet_name}: {win_rate:.0%} win rate ({total_closed} trades) → {adjusted_multiplier:.2f}x sizing")
 
         copy_size = original_size * base_ratio
         copy_size = max(MIN_COPY_SIZE, min(MAX_COPY_SIZE, copy_size))
@@ -594,6 +679,21 @@ class Portfolio:
                 if copy_size < MIN_COPY_SIZE:
                     print(f"  ❌ Cannot open position - max exposure reached")
                     MISSED_TRADES.labels(reason="max_exposure").inc()
+                    # Log missed trade for analysis
+                    missed_trade = {
+                        "timestamp": datetime.now().isoformat(),
+                        "trader": wallet_name,
+                        "side": side,
+                        "market": market,
+                        "token_id": token_id,
+                        "price": price,
+                        "intended_size": original_size * base_ratio,
+                        "reason": "max_exposure",
+                        "slug": slug,
+                        "category": category
+                    }
+                    self.missed_trades.append(missed_trade)
+                    self._log_missed_trade(missed_trade)
                     return False
 
         fee = copy_size * 0.001
@@ -653,6 +753,7 @@ class Portfolio:
         self.wallet_stats[wallet_name]["trades"] += 1
         self.wallet_stats[wallet_name]["volume"] += copy_size
 
+        outcome = trade_data.get("outcome")  # "Yes" or "No"
         trade_record = {
             "timestamp": datetime.now().isoformat(),
             "side": side,
@@ -660,6 +761,7 @@ class Portfolio:
             "category": category,
             "token_id": token_id,
             "slug": slug,
+            "outcome": outcome,
             "original_size": original_size,
             "copy_size": copy_size,
             "price": price,
@@ -688,7 +790,7 @@ class Portfolio:
         portfolio_value = self.balance + exposure
         TOTAL_EXPOSURE.set(exposure)
         PORTFOLIO_VALUE.set(portfolio_value)
-        UNREALISED_PNL.set(portfolio_value - STARTING_BALANCE - self.realised_pnl)
+        UNREALISED_PNL.set(self.get_unrealised_pnl())  # True unrealised from live prices
 
         # Update per-wallet metrics
         for wname, stats in self.wallet_stats.items():
@@ -749,10 +851,27 @@ class Portfolio:
         if side == "SELL":
             self.category_stats[category]["pnl"] += trade_pnl
 
+        # Daily P&L tracking
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today not in self.daily_pnl:
+            self.daily_pnl[today] = {"pnl": 0.0, "trades": 0, "volume": 0.0, "wins": 0, "losses": 0}
+        self.daily_pnl[today]["trades"] += 1
+        self.daily_pnl[today]["volume"] += copy_size
+        if side == "SELL":
+            self.daily_pnl[today]["pnl"] += trade_pnl
+            if trade_pnl >= 0:
+                self.daily_pnl[today]["wins"] += 1
+            else:
+                self.daily_pnl[today]["losses"] += 1
+
         return True
 
     def _log_trade(self, trade: dict):
         with open(LOG_FILE, "a") as f:
+            f.write(json.dumps(trade) + "\n")
+
+    def _log_missed_trade(self, trade: dict):
+        with open(MISSED_TRADES_FILE, "a") as f:
             f.write(json.dumps(trade) + "\n")
 
     def check_stop_losses(self, price_fetcher) -> list:
@@ -790,8 +909,41 @@ class Portfolio:
         return rates
 
     def get_portfolio_value(self) -> float:
-        exposure = sum(p["cost"] for p in self.positions.values())
-        return self.balance + exposure
+        """Get portfolio value using live prices if available, otherwise cost basis."""
+        if self.position_prices:
+            # Use live market values
+            market_value = 0
+            for token_id, pos in self.positions.items():
+                if token_id in self.position_prices:
+                    market_value += pos["size"] * self.position_prices[token_id]
+                else:
+                    market_value += pos["cost"]  # Fallback to cost basis
+            return self.balance + market_value
+        else:
+            # Fallback to cost basis
+            exposure = sum(p["cost"] for p in self.positions.values())
+            return self.balance + exposure
+
+    def get_unrealised_pnl(self) -> float:
+        """Calculate true unrealised P&L using live prices.
+
+        For positions without live prices (ended markets), use entry price
+        as current price (contributing 0 to P&L). This prevents wild swings
+        when price fetches fail intermittently.
+        """
+        unrealised = 0.0
+        for token_id, pos in self.positions.items():
+            entry_price = pos["entry_price"]
+            shares = pos["size"]
+            # Use live price if available, otherwise entry price (0 P&L)
+            current_price = self.position_prices.get(token_id, entry_price)
+            # P&L = (current - entry) * shares
+            unrealised += (current_price - entry_price) * shares
+        return unrealised
+
+    def get_exposure(self) -> float:
+        """Get total exposure (cost basis of open positions)."""
+        return sum(p["cost"] for p in self.positions.values())
 
     def summary(self):
         pv = self.get_portfolio_value()
@@ -852,19 +1004,32 @@ class CigarettesTracker:
             self.monitor_websocket(),
             self.monitor_onchain(),
             self.poll_data_api(),
-            self.periodic_status()
+            self.periodic_status(),
+            self.update_position_prices()
         ]
         if self.auto_withdrawal and self.auto_withdrawal.enabled:
             tasks.append(self.periodic_withdrawal_check())
         await asyncio.gather(*tasks)
 
     async def monitor_websocket(self):
-        """Monitor Polymarket WebSocket for real-time trade activity."""
-        print("🌐 Starting WebSocket monitor...")
+        """Monitor Polymarket WebSocket for real-time trade activity.
+
+        NOTE: The user channel requires API authentication (key, secret, passphrase).
+        Without credentials, this will fail. API polling is used as the primary detection method.
+        """
+        # WebSocket disabled - requires API auth which we don't have
+        # Keeping code for when API credentials become available
+        print("🌐 WebSocket monitor disabled (requires API auth)")
+        print("   Using API polling (every 10s) as primary detection")
         WEBSOCKET_CONNECTED.set(0)
 
-        # WebSocket endpoint for user activity
-        ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+        # Just keep the task alive but do nothing
+        while self.running:
+            await asyncio.sleep(60)
+
+        # Original WebSocket code (requires auth):
+        # ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+        return
 
         while self.running:
             try:
@@ -921,7 +1086,7 @@ class CigarettesTracker:
                     print(f"\n⚡ [WS] {side} detected from @{wallet_name}")
 
                     # Get market info
-                    _, market_name, slug, category = await self.get_token_price(str(token_id))
+                    _, market_name, slug, category, outcome, option_name = await self.get_token_price(str(token_id))
 
                     trade_data = {
                         "side": side,
@@ -929,9 +1094,11 @@ class CigarettesTracker:
                         "price": price,
                         "market": market_name,
                         "token_id": str(token_id),
+                        "option_name": option_name,
                         "trader": wallet_name,
                         "slug": slug,
-                        "category": category
+                        "category": category,
+                        "outcome": outcome
                     }
 
                     # Deduplicate with seen_trades
@@ -978,6 +1145,8 @@ class CigarettesTracker:
             "id": 1
         }) as resp:
             data = await resp.json()
+            if "result" not in data:
+                return  # RPC error, skip this cycle
             current_block = int(data["result"], 16)
 
         if current_block <= self.last_block:
@@ -1049,10 +1218,18 @@ class CigarettesTracker:
         TRADES_DETECTED.labels(wallet=wallet_name).inc()
 
         # Fetch real price from Polymarket API
-        price, market_name, slug, category = await self.get_token_price(str(token_id))
+        price, market_name, slug, category, outcome, option_name = await self.get_token_price(str(token_id))
+
+        # Skip trade if we couldn't get a real price
+        if price is None:
+            print(f"\n⚠ Skipping {side} from @{wallet_name} - couldn't fetch real price")
+            print(f"   Market: {market_name}")
+            return
 
         print(f"\n{'[BUY]' if side == 'BUY' else '[SELL]'} @{wallet_name} {side}")
         print(f"   Market:   {market_name}")
+        if option_name:
+            print(f"   Option:   {option_name} ({outcome})")
         print(f"   Size:     ${size_usd:,.2f}")
         print(f"   Price:    ${price:.4f}")
         print(f"   TX:       {tx_hash[:20]}...")
@@ -1066,7 +1243,9 @@ class CigarettesTracker:
             "token_id": str(token_id),
             "trader": wallet_name,
             "slug": slug,
-            "category": category
+            "category": category,
+            "outcome": outcome,
+            "option_name": option_name
         }
 
         success = self.portfolio.copy_trade(trade_data)
@@ -1076,16 +1255,19 @@ class CigarettesTracker:
             print(f"   -> COPIED: {side} ${copy_size:.2f} @ ${price:.4f}")
             print(f"   -> Balance: ${self.portfolio.balance:,.2f} | P&L: ${self.portfolio.realised_pnl:+,.2f}")
 
-    async def get_token_price(self, token_id: str) -> tuple[float, str, str, str]:
-        """Fetch real price, market name, slug, and category for a token ID."""
+    async def get_token_price(self, token_id: str) -> tuple[float, str, str, str, str, str]:
+        """Fetch real price, market name, slug, category, outcome, and option name for a token ID.
+        Returns None for price if unable to fetch real price - NEVER uses fake/default prices.
+        Returns: (price, market_name, slug, category, outcome, option_name)
+        """
         # Check cache first
         if token_id in self.price_cache:
             cached = self.price_cache[token_id]
             if time.time() - cached["time"] < 60:  # Cache for 60 seconds
-                return cached["price"], cached["market"], cached.get("slug"), cached.get("category", "Other")
+                return cached["price"], cached["market"], cached.get("slug"), cached.get("category", "Other"), cached.get("outcome"), cached.get("option_name")
 
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-        price = 0.5
+        price = None  # No default - must get real price
         market_name = f"Token {token_id[:20]}..."
         condition_id = None
 
@@ -1109,9 +1291,11 @@ class CigarettesTracker:
         except Exception as e:
             pass
 
-        # Get market name, slug, and category from gamma API
+        # Get market name, slug, category, outcome, and option name from gamma API
         slug = None
         category = None
+        outcome = None
+        option_name = None
         try:
             url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
             async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -1121,6 +1305,17 @@ class CigarettesTracker:
                         market_data = data[0]
                         market_name = market_data.get("question", market_name)
                         slug = market_data.get("slug", "")
+
+                        # Get the option name (e.g., "SRZP" for multi-outcome markets)
+                        option_name = market_data.get("groupItemTitle")
+
+                        # Determine outcome by matching token_id to clobTokenIds
+                        clob_tokens = market_data.get("clobTokenIds", [])
+                        outcomes_list = market_data.get("outcomes", ["Yes", "No"])
+                        if token_id in clob_tokens:
+                            idx = clob_tokens.index(token_id)
+                            if idx < len(outcomes_list):
+                                outcome = outcomes_list[idx]  # "Yes" or "No"
 
                         # Try to get category from API (multiple sources)
                         # 1. Direct category field
@@ -1139,9 +1334,6 @@ class CigarettesTracker:
                                 series_title = event["series"][0].get("title", "").lower()
                                 if any(s in series_title for s in ["nba", "nfl", "mlb", "nhl", "ufc", "pga", "tennis", "soccer", "football"]):
                                     category = "Sports"
-                        # 4. groupItemTitle
-                        elif market_data.get("groupItemTitle"):
-                            category = market_data["groupItemTitle"]
         except:
             pass
 
@@ -1167,9 +1359,11 @@ class CigarettesTracker:
             "market": market_name,
             "slug": slug,
             "category": category,
+            "outcome": outcome,
+            "option_name": option_name,
             "time": time.time()
         }
-        return price, market_name, slug, category
+        return price, market_name, slug, category, outcome, option_name
 
     async def get_market_name(self, token_id: str) -> str:
         """Get market name from token ID."""
@@ -1185,29 +1379,81 @@ class CigarettesTracker:
         return f"Token {token_id[:20]}..."
 
     async def poll_data_api(self):
-        """Poll Polymarket data API for user activity."""
-        print("Starting data API polling...")
+        """Poll Polymarket data API for recent trades."""
+        import sys
+        print("📡 Starting data API polling (every 10s)...", flush=True)
+
+        # Track last seen trade timestamp per wallet
+        last_seen = {addr: 0 for addr in TRACKED_WALLETS}
+        poll_count = 0
 
         while self.running:
             try:
-                # Poll positions for all tracked wallets
+                poll_count += 1
+                if poll_count % 30 == 1:  # Log every 5 minutes
+                    print(f"📡 API poll #{poll_count} - checking {len(TRACKED_WALLETS)} wallets", flush=True)
                 for wallet_addr, wallet_name in TRACKED_WALLETS.items():
-                    url = f"{POLYMARKET_DATA}/positions?user={wallet_addr}"
-                    async with self.session.get(url) as resp:
+                    url = f"{POLYMARKET_DATA}/trades?user={wallet_addr}&limit=10"
+                    async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         if resp.status == 200:
-                            data = await resp.json()
-                            await self.process_positions(data, wallet_name)
+                            trades = await resp.json()
+                            # Process trades oldest-first to maintain correct last_seen
+                            for trade in reversed(trades):
+                                ts = trade.get("timestamp", 0)
+                                if ts > last_seen[wallet_addr]:
+                                    # New trade detected
+                                    side = trade.get("side", "").upper()
+                                    size = float(trade.get("size", 0))
+                                    token_id = trade.get("asset", "")
+                                    slug = trade.get("slug", "")
+                                    market_name = trade.get("title", f"Token {token_id[:20]}...")
+
+                                    # Get real price - skip if not available
+                                    raw_price = trade.get("price")
+                                    if raw_price is None or raw_price == 0:
+                                        print(f"\n⚠ Skipping {side} from @{wallet_name} - no price in API response")
+                                        last_seen[wallet_addr] = ts
+                                        continue
+                                    price = float(raw_price)
+
+                                    if side in ["BUY", "SELL"] and size > 0:
+                                        # Deduplicate
+                                        trade_key = f"{wallet_name}:{token_id}:{side}:{size:.2f}"
+                                        if trade_key not in self.seen_trades:
+                                            self.seen_trades.add(trade_key)
+
+                                            # Get category
+                                            category = detect_category(market_name, slug)
+
+                                            # Try to get outcome from cache
+                                            cached = self.price_cache.get(str(token_id), {})
+                                            outcome = cached.get("outcome")
+
+                                            trade_data = {
+                                                "side": side,
+                                                "size": size * price,
+                                                "price": price,
+                                                "market": market_name,
+                                                "token_id": str(token_id),
+                                                "trader": wallet_name,
+                                                "slug": slug,
+                                                "category": category,
+                                                "outcome": outcome
+                                            }
+
+                                            print(f"\n📡 [API] {side} detected from @{wallet_name}", flush=True)
+                                            print(f"   Market: {market_name[:50]}...", flush=True)
+
+                                            success = self.portfolio.copy_trade(trade_data)
+                                            if success:
+                                                print(f"   📡 API COPIED", flush=True)
+
+                                    # Update last_seen after processing each trade
+                                    last_seen[wallet_addr] = ts
             except Exception as e:
-                pass  # Silent fail for polling
+                print(f"⚠ API polling error: {e}")
 
-            await asyncio.sleep(30)  # Poll every 30 seconds
-
-    async def process_positions(self, data, wallet_name: str = "unknown"):
-        """Process position data from API."""
-        # This would compare current vs previous positions
-        # For now just log if we get data
-        if data:
-            pass  # Position tracking could go here
+            await asyncio.sleep(10)  # Poll every 10 seconds
 
     async def periodic_status(self):
         """Print status periodically."""
@@ -1215,7 +1461,84 @@ class CigarettesTracker:
             await asyncio.sleep(60)  # Every minute
             pv = self.portfolio.get_portfolio_value()
             roi = ((pv - STARTING_BALANCE) / STARTING_BALANCE) * 100
-            print(f"\n📊 Status: {len(self.portfolio.trades)} trades | Portfolio: ${pv:,.2f} | ROI: {roi:+.2f}% | Block: {self.last_block}\n")
+            unrealised = self.portfolio.get_unrealised_pnl()
+            print(f"\n📊 Status: {len(self.portfolio.trades)} trades | Portfolio: ${pv:,.2f} | Unrealised: ${unrealised:+,.2f} | ROI: {roi:+.2f}% | Block: {self.last_block}\n")
+
+    async def update_position_prices(self):
+        """Periodically fetch live prices for all open positions."""
+        print("💰 Starting position price updater (every 2 min)...")
+        await asyncio.sleep(10)  # Initial delay to let things start
+
+        while self.running:
+            try:
+                positions = list(self.portfolio.positions.keys())
+                if not positions:
+                    await asyncio.sleep(120)
+                    continue
+
+                updated = 0
+                failed = 0
+                headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+
+                # Batch fetch prices (max 10 concurrent to avoid rate limits)
+                batch_size = 10
+                for i in range(0, len(positions), batch_size):
+                    batch = positions[i:i + batch_size]
+                    tasks = []
+                    for token_id in batch:
+                        tasks.append(self._fetch_token_price(token_id, headers))
+
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for token_id, result in zip(batch, results):
+                        if isinstance(result, Exception):
+                            failed += 1
+                        elif result is not None:
+                            self.portfolio.position_prices[token_id] = result
+                            updated += 1
+                        else:
+                            failed += 1
+
+                    # Small delay between batches to avoid rate limits
+                    if i + batch_size < len(positions):
+                        await asyncio.sleep(1)
+
+                self.portfolio.last_price_update = time.time()
+
+                # Update metrics with live prices
+                unrealised = self.portfolio.get_unrealised_pnl()
+                pv = self.portfolio.get_portfolio_value()
+                UNREALISED_PNL.set(unrealised)
+                PORTFOLIO_VALUE.set(pv)
+                roi = ((pv - STARTING_BALANCE) / STARTING_BALANCE) * 100
+                ROI_PERCENT.set(roi)
+
+                print(f"💰 Updated {updated}/{len(positions)} prices | Unrealised P&L: ${unrealised:+,.2f}")
+
+            except Exception as e:
+                print(f"⚠ Price update error: {e}")
+
+            await asyncio.sleep(120)  # Update every 2 minutes
+
+    async def _fetch_token_price(self, token_id: str, headers: dict) -> float:
+        """Fetch current price for a single token."""
+        try:
+            url = f"https://clob.polymarket.com/book?token_id={token_id}"
+            async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("last_trade_price"):
+                        return float(data["last_trade_price"])
+                    # Fallback to mid price
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    if bids and asks:
+                        best_bid = float(bids[0]["price"])
+                        best_ask = float(asks[-1]["price"])
+                        return (best_bid + best_ask) / 2
+        except:
+            pass
+        return None
 
     async def periodic_withdrawal_check(self):
         """Check for auto-withdrawal periodically."""
@@ -1277,44 +1600,126 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             return iso_timestamp[:16] if iso_timestamp else ""
 
     async def get_all_trades(request):
-        """Return all trades with open/closed status."""
+        """Return all trades with open/closed status, current price, and P&L."""
         all_trades = []
-        # Track which buys have been closed
         open_positions = set(portfolio.positions.keys())
+
+        # Build a map of BUY trades by token_id to link with SELLs
+        buy_prices = {}  # token_id -> list of (price, timestamp) for BUYs
+        for trade in portfolio.trades:
+            if trade.get("side") == "BUY":
+                token_id = trade.get("token_id", "")
+                if token_id not in buy_prices:
+                    buy_prices[token_id] = []
+                buy_prices[token_id].append({
+                    "price": trade.get("price", 0),
+                    "timestamp": trade.get("timestamp", ""),
+                    "outcome": trade.get("outcome")
+                })
 
         for trade in reversed(portfolio.trades):  # Most recent first
             token_id = trade.get("token_id", "unknown")
             side = trade["side"]
+            trade_price = trade.get("price", 0)
+            copy_size = trade.get("copy_size", 0)
 
             if side == "SELL":
                 status = "CLOSED"
+                exit_price = trade_price
+                # Find the original BUY entry price
+                entry_price = None
+                outcome = trade.get("outcome")
+                if token_id in buy_prices and buy_prices[token_id]:
+                    # Use the earliest BUY price as entry
+                    buy_info = buy_prices[token_id][0]
+                    entry_price = buy_info["price"]
+                    if not outcome:
+                        outcome = buy_info.get("outcome")
+
+                # Calculate P&L for SELL
+                if entry_price and entry_price > 0 and exit_price:
+                    pnl = (exit_price - entry_price) * (copy_size / exit_price) if exit_price > 0 else 0
+                    pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                else:
+                    pnl = trade.get("trade_pnl", 0)
+                    pnl_pct = None
+
+                current_price = exit_price  # Show exit price as "current" for closed trades
             else:
-                # BUY - check if position is still open
-                status = "OPEN" if token_id in open_positions else "CLOSED"
+                # BUY trade
+                entry_price = trade_price
+                outcome = trade.get("outcome")
+
+                if token_id in open_positions:
+                    status = "OPEN"
+                    current_price = portfolio.position_prices.get(token_id)
+                    if current_price and entry_price > 0:
+                        pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                        pnl = (current_price - entry_price) * (copy_size / entry_price)
+                    else:
+                        # No live price - use entry as current (0 P&L until we get price)
+                        current_price = entry_price
+                        pnl = 0.0
+                        pnl_pct = 0.0
+                else:
+                    # Closed BUY - find the SELL price
+                    status = "CLOSED"
+                    sell_price = None
+                    for t in portfolio.trades:
+                        if t.get("token_id") == token_id and t.get("side") == "SELL":
+                            sell_price = t.get("price")
+                            break
+                    current_price = sell_price if sell_price else entry_price
+                    if sell_price and entry_price > 0:
+                        pnl = (sell_price - entry_price) * (copy_size / entry_price)
+                        pnl_pct = ((sell_price - entry_price) / entry_price) * 100
+                    else:
+                        # No sell price found - show 0 P&L
+                        pnl = 0.0
+                        pnl_pct = 0.0
+
+            # Use stored outcome, or derive from price as last resort
+            if not outcome:
+                # Try to get from trade data first
+                outcome = trade.get("outcome")
+            if not outcome:
+                # Fallback: derive from price (less accurate for multi-outcome markets)
+                price_for_outcome = entry_price if entry_price else (current_price if current_price else None)
+                if price_for_outcome:
+                    outcome = "Yes" if price_for_outcome >= 0.5 else "No"
 
             slug = trade.get("slug", "")
-            market_url = f"https://polymarket.com/event/{slug}" if slug else ""
             market_name = trade.get("market", "Unknown")
             category = trade.get("category")
             if not category or category == "Other":
                 category = detect_category(market_name, slug)
+
+            # Get option name for multi-outcome markets
+            option_name = trade.get("option_name")
+
             all_trades.append({
                 "timestamp": format_timestamp(trade.get("timestamp", "")),
+                "status": status,
                 "category": category,
                 "trader": trade.get("trader", "unknown"),
                 "side": side,
-                "market": trade.get("market", "Unknown"),
+                "outcome": outcome,
+                "option": option_name,  # e.g., "SRZP" for multi-outcome markets
+                "market": market_name,
                 "slug": slug,
-                "price": round(trade.get("price", 0), 4),
-                "copy_size": round(trade.get("copy_size", 0), 2)
+                "entry": round(entry_price, 4) if entry_price else None,
+                "current": round(current_price, 4) if current_price else None,
+                "size": round(copy_size, 2),
+                "pnl": round(pnl, 2) if pnl is not None else None,
+                "pnl_pct": round(pnl_pct, 1) if pnl_pct is not None else None
             })
         return web.json_response(all_trades)
 
     async def get_summary(request):
         """Return portfolio summary."""
         pv = portfolio.get_portfolio_value()
-        unrealised = pv - STARTING_BALANCE - portfolio.realised_pnl
-        exposure = sum(p["cost"] for p in portfolio.positions.values())
+        unrealised = portfolio.get_unrealised_pnl()  # True unrealised using live prices
+        exposure = portfolio.get_exposure()
         roi = ((pv - STARTING_BALANCE) / STARTING_BALANCE) * 100
         total_wins = sum(s["wins"] for s in portfolio.wallet_stats.values())
         total_losses = sum(s["losses"] for s in portfolio.wallet_stats.values())
@@ -1347,7 +1752,9 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "uptime_hours": round(uptime_seconds / 3600, 1),
             "change_24h": round(pv - portfolio.value_24h_ago, 2),
             "best_trader": best_trader,
-            "worst_trader": worst_trader
+            "worst_trader": worst_trader,
+            "prices_updated": portfolio.last_price_update > 0,
+            "prices_age_sec": round(time.time() - portfolio.last_price_update) if portfolio.last_price_update > 0 else None
         })
 
     async def get_categories(request):
@@ -1414,6 +1821,309 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "trailing_stop_pct": TRAILING_STOP_LOSS * 100
         })
 
+    async def get_missed_trades(request):
+        """Return missed trades for analysis."""
+        # Calculate potential value for each missed trade
+        missed_with_current = []
+        for trade in portfolio.missed_trades:
+            token_id = trade.get("token_id", "")
+            entry_price = trade.get("price", 0)
+            # Try to get current price
+            current_price = entry_price  # Default to entry if can't fetch
+            try:
+                url = f"https://clob.polymarket.com/book?token_id={token_id}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("last_trade_price"):
+                                current_price = float(data["last_trade_price"])
+            except:
+                pass
+
+            intended_size = trade.get("intended_size", 0)
+            potential_pnl = (current_price - entry_price) * (intended_size / entry_price) if entry_price > 0 else 0
+
+            missed_with_current.append({
+                **trade,
+                "current_price": round(current_price, 4),
+                "potential_pnl": round(potential_pnl, 2),
+                "potential_pnl_pct": round((current_price - entry_price) / entry_price * 100, 2) if entry_price > 0 else 0
+            })
+
+        total_missed_volume = sum(t.get("intended_size", 0) for t in portfolio.missed_trades)
+        total_potential_pnl = sum(t.get("potential_pnl", 0) for t in missed_with_current)
+
+        return web.json_response({
+            "total_missed": len(portfolio.missed_trades),
+            "total_missed_volume": round(total_missed_volume, 2),
+            "total_potential_pnl": round(total_potential_pnl, 2),
+            "trades": missed_with_current[-100:]  # Last 100 missed trades
+        })
+
+    async def get_daily_pnl(request):
+        """Return daily P&L breakdown for charts."""
+        daily_data = []
+        cumulative_pnl = 0
+        for date_str in sorted(portfolio.daily_pnl.keys()):
+            day = portfolio.daily_pnl[date_str]
+            cumulative_pnl += day["pnl"]
+            win_rate = day["wins"] / (day["wins"] + day["losses"]) if (day["wins"] + day["losses"]) > 0 else 0
+            daily_data.append({
+                "date": date_str,
+                "pnl": round(day["pnl"], 2),
+                "cumulative_pnl": round(cumulative_pnl, 2),
+                "trades": day["trades"],
+                "volume": round(day["volume"], 2),
+                "wins": day["wins"],
+                "losses": day["losses"],
+                "win_rate": round(win_rate, 2)
+            })
+        return web.json_response(daily_data)
+
+    async def reset_entry_prices(request):
+        """Reset entry prices to current prices for positions with default 0.5 price.
+        This zeros out unrealised P&L but gives accurate going-forward tracking.
+        """
+        reset_count = 0
+        skipped = 0
+
+        for token_id, pos in portfolio.positions.items():
+            entry_price = pos.get("entry_price", 0)
+            # Only reset positions with default price (0.5)
+            if entry_price == 0.5:
+                current_price = portfolio.position_prices.get(token_id)
+                if current_price and current_price != 0.5:
+                    pos["entry_price"] = current_price
+                    # Recalculate cost based on new entry price
+                    pos["cost"] = pos["size"] * current_price
+                    reset_count += 1
+                else:
+                    skipped += 1
+
+        # Also update the trades in memory
+        for trade in portfolio.trades:
+            if trade.get("price") == 0.5 and trade.get("side") == "BUY":
+                token_id = trade.get("token_id")
+                current_price = portfolio.position_prices.get(token_id)
+                if current_price and current_price != 0.5:
+                    trade["price"] = current_price
+
+        return web.json_response({
+            "status": "success",
+            "reset_count": reset_count,
+            "skipped_no_price": skipped,
+            "message": f"Reset {reset_count} positions to current market prices. Unrealised P&L recalculated."
+        })
+
+    async def update_trade_prices(request):
+        """Update prices for specific trades (used for backfilling historical prices).
+        POST body: {"updates": [{"token_id": "...", "timestamp": "...", "price": 0.067}, ...]}
+        """
+        try:
+            data = await request.json()
+            updates = data.get("updates", [])
+
+            if not updates:
+                return web.json_response({"error": "No updates provided"}, status=400)
+
+            # Create lookup by token_id + timestamp
+            update_map = {}
+            for u in updates:
+                key = (u.get("token_id", ""), u.get("timestamp", ""))
+                if key[0] and key[1] and u.get("price"):
+                    update_map[key] = float(u["price"])
+
+            updated_count = 0
+            # Update in-memory trades
+            for trade in portfolio.trades:
+                key = (trade.get("token_id", ""), trade.get("timestamp", ""))
+                if key in update_map:
+                    old_price = trade.get("price")
+                    new_price = update_map[key]
+                    if old_price != new_price:
+                        trade["price"] = new_price
+                        updated_count += 1
+
+            # Also update positions if they have matching entry prices
+            for token_id, pos in portfolio.positions.items():
+                for u in updates:
+                    if u.get("token_id") == token_id and pos.get("entry_price") in [0.5, 0, 0.0]:
+                        new_price = float(u["price"])
+                        pos["entry_price"] = new_price
+                        pos["cost"] = pos["size"] * new_price
+
+            # Rewrite the log file with updated prices
+            if updated_count > 0:
+                with open(LOG_FILE, 'w') as f:
+                    for t in portfolio.trades:
+                        f.write(json.dumps(t) + "\n")
+
+            return web.json_response({
+                "status": "success",
+                "updates_received": len(updates),
+                "trades_updated": updated_count
+            })
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def remove_fake_prices(request):
+        """Remove all trades and positions with fake/default prices (0.5, 0).
+        Also removes orphan SELLs (SELLs without matching BUYs)."""
+        fake_prices = [0.5, 0, 0.0]
+
+        # Count before
+        trades_before = len(portfolio.trades)
+        positions_before = len(portfolio.positions)
+
+        # Remove ALL trades with fake prices (BUYs and SELLs)
+        portfolio.trades = [t for t in portfolio.trades
+                          if t.get("price") not in fake_prices]
+
+        # Find all token_ids that have BUY trades
+        buy_token_ids = {t.get("token_id") for t in portfolio.trades if t.get("side") == "BUY"}
+
+        # Remove orphan SELLs (SELLs without matching BUYs)
+        orphan_sells_before = len([t for t in portfolio.trades if t.get("side") == "SELL"])
+        portfolio.trades = [t for t in portfolio.trades
+                          if t.get("side") != "SELL" or t.get("token_id") in buy_token_ids]
+        orphan_sells_removed = orphan_sells_before - len([t for t in portfolio.trades if t.get("side") == "SELL"])
+
+        # Remove positions with fake entry prices
+        positions_to_remove = [tid for tid, pos in portfolio.positions.items()
+                              if pos.get("entry_price") in fake_prices]
+        for tid in positions_to_remove:
+            del portfolio.positions[tid]
+            if tid in portfolio.position_prices:
+                del portfolio.position_prices[tid]
+            if tid in portfolio.position_wallet:
+                del portfolio.position_wallet[tid]
+
+        # Rewrite log file
+        with open(LOG_FILE, 'w') as f:
+            for t in portfolio.trades:
+                f.write(json.dumps(t) + "\n")
+
+        trades_removed = trades_before - len(portfolio.trades)
+        positions_removed = positions_before - len(portfolio.positions)
+
+        return web.json_response({
+            "status": "success",
+            "trades_removed": trades_removed,
+            "orphan_sells_removed": orphan_sells_removed,
+            "positions_removed": positions_removed,
+            "trades_remaining": len(portfolio.trades),
+            "positions_remaining": len(portfolio.positions)
+        })
+
+    async def backfill_outcomes(request):
+        """Backfill correct YES/NO outcomes and option names for existing trades by querying gamma API."""
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        updated = 0
+        failed = 0
+
+        # Get unique token_ids that need outcome lookup
+        tokens_to_lookup = set()
+        for trade in portfolio.trades:
+            if not trade.get("outcome") or trade.get("outcome") in ["YES", "NO"] or not trade.get("option_name"):
+                tokens_to_lookup.add(trade.get("token_id"))
+
+        async with aiohttp.ClientSession() as session:
+            for token_id in tokens_to_lookup:
+                if not token_id:
+                    continue
+                try:
+                    url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data and len(data) > 0:
+                                market_data = data[0]
+                                clob_tokens = market_data.get("clobTokenIds", [])
+                                outcomes_list = market_data.get("outcomes", ["Yes", "No"])
+                                option_name = market_data.get("groupItemTitle")  # e.g., "SRZP"
+
+                                outcome = None
+                                if token_id in clob_tokens:
+                                    idx = clob_tokens.index(token_id)
+                                    if idx < len(outcomes_list):
+                                        outcome = outcomes_list[idx]
+
+                                # Update all trades with this token_id
+                                for trade in portfolio.trades:
+                                    if trade.get("token_id") == token_id:
+                                        if outcome:
+                                            trade["outcome"] = outcome
+                                        if option_name:
+                                            trade["option_name"] = option_name
+                                        updated += 1
+                except:
+                    failed += 1
+
+                await asyncio.sleep(0.1)  # Rate limit
+
+        # Rewrite log file
+        with open(LOG_FILE, 'w') as f:
+            for t in portfolio.trades:
+                f.write(json.dumps(t) + "\n")
+
+        return web.json_response({
+            "status": "success",
+            "tokens_checked": len(tokens_to_lookup),
+            "trades_updated": updated,
+            "failed": failed
+        })
+
+    async def debug_positions(request):
+        """Debug endpoint to verify position prices and P&L calculations."""
+        positions_data = []
+        total_unrealised = 0
+
+        for token_id, pos in list(portfolio.positions.items())[:20]:  # First 20
+            entry_price = pos.get("entry_price", 0)
+            current_price = portfolio.position_prices.get(token_id)
+            shares = pos.get("size", 0)
+            cost = pos.get("cost", 0)
+            market = pos.get("market", "Unknown")[:50]
+
+            if current_price is not None:
+                pos_pnl = (current_price - entry_price) * shares
+                current_value = shares * current_price
+            else:
+                pos_pnl = 0
+                current_value = cost
+
+            total_unrealised += pos_pnl
+
+            positions_data.append({
+                "token_id": token_id[:20] + "...",
+                "market": market,
+                "entry_price": round(entry_price, 4),
+                "current_price": round(current_price, 4) if current_price else None,
+                "shares": round(shares, 2),
+                "cost": round(cost, 2),
+                "current_value": round(current_value, 2),
+                "pnl": round(pos_pnl, 2)
+            })
+
+        # Price distribution
+        prices = list(portfolio.position_prices.values())
+        price_stats = {
+            "count": len(prices),
+            "min": round(min(prices), 4) if prices else None,
+            "max": round(max(prices), 4) if prices else None,
+            "avg": round(sum(prices) / len(prices), 4) if prices else None,
+            "outside_0_1": len([p for p in prices if p < 0 or p > 1])
+        }
+
+        return web.json_response({
+            "total_positions": len(portfolio.positions),
+            "prices_fetched": len(portfolio.position_prices),
+            "price_stats": price_stats,
+            "sample_positions": positions_data,
+            "calculated_unrealised_sample": round(total_unrealised, 2)
+        })
+
     async def reconcile_positions(request):
         """Compare local positions against on-chain data."""
         issues = []
@@ -1452,8 +2162,37 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     async def get_root(request):
         return web.json_response({
             "service": "Polymarket Copy Trader",
-            "endpoints": ["/summary", "/categories", "/trades", "/all", "/closed", "/wallets", "/risk", "/reconcile", "/withdrawal", "/prometheus"],
+            "endpoints": ["/health", "/summary", "/categories", "/trades", "/all", "/closed", "/wallets", "/risk", "/missed", "/daily", "/reconcile", "/withdrawal", "/backfill-prices", "/prometheus"],
             "status": "running"
+        })
+
+    async def get_health(request):
+        """Health check endpoint for monitoring."""
+        pv = portfolio.get_portfolio_value()
+        exposure = sum(p["cost"] for p in portfolio.positions.values())
+        uptime = (datetime.now() - portfolio.start_time).total_seconds()
+
+        # Check if API polling is working (trades in last 10 minutes)
+        recent_trades = [t for t in portfolio.trades[-20:] if t.get("timestamp")]
+        api_healthy = len(recent_trades) > 0
+
+        return web.json_response({
+            "status": "healthy" if api_healthy else "degraded",
+            "uptime_seconds": round(uptime),
+            "websocket_connected": WEBSOCKET_CONNECTED._value._value if hasattr(WEBSOCKET_CONNECTED, '_value') else 0,
+            "total_trades": len(portfolio.trades),
+            "open_positions": len(portfolio.positions),
+            "missed_trades": len(portfolio.missed_trades),
+            "portfolio_value": round(pv, 2),
+            "exposure_pct": round(exposure / STARTING_BALANCE * 100, 1),
+            "log_file": str(LOG_FILE),
+            "volume_mounted": VOLUME_PATH.exists(),
+            "checks": {
+                "api_polling": api_healthy,
+                "log_writable": LOG_FILE.parent.exists(),
+                "kill_switch": check_kill_switch(),
+                "trading_paused": portfolio.trading_paused
+            }
         })
 
     async def get_metrics(request):
@@ -1461,6 +2200,57 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         from prometheus_client import generate_latest
         metrics = generate_latest()
         return web.Response(text=metrics.decode('utf-8'), content_type='text/plain')
+
+    async def trigger_price_update(request):
+        """Manually trigger a full price update for all positions."""
+        positions = list(portfolio.positions.keys())
+        if not positions:
+            return web.json_response({"status": "no_positions", "updated": 0})
+
+        updated = 0
+        failed = 0
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+
+        async with aiohttp.ClientSession() as session:
+            batch_size = 20
+            for i in range(0, len(positions), batch_size):
+                batch = positions[i:i + batch_size]
+                for token_id in batch:
+                    try:
+                        url = f"https://clob.polymarket.com/book?token_id={token_id}"
+                        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                price = None
+                                if data.get("last_trade_price"):
+                                    price = float(data["last_trade_price"])
+                                elif data.get("bids") and data.get("asks"):
+                                    bids = data["bids"]
+                                    asks = data["asks"]
+                                    if bids and asks:
+                                        price = (float(bids[0]["price"]) + float(asks[0]["price"])) / 2
+                                if price and 0 < price < 1:
+                                    portfolio.position_prices[token_id] = price
+                                    updated += 1
+                                else:
+                                    failed += 1
+                            else:
+                                failed += 1
+                    except:
+                        failed += 1
+
+                # Small delay between batches
+                if i + batch_size < len(positions):
+                    await asyncio.sleep(0.5)
+
+        portfolio.last_price_update = time.time()
+
+        return web.json_response({
+            "status": "success",
+            "total_positions": len(positions),
+            "updated": updated,
+            "failed": failed
+        })
 
     async def get_withdrawal_status(request):
         """Return auto-withdrawal status and history."""
@@ -1479,6 +2269,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
 
     app = web.Application()
     app.router.add_get("/", get_root)
+    app.router.add_get("/health", get_health)
     app.router.add_get("/prometheus", get_metrics)
     app.router.add_get("/trades", get_trades)
     app.router.add_get("/closed", get_closed_trades)
@@ -1487,7 +2278,15 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_get("/categories", get_categories)
     app.router.add_get("/wallets", get_wallets)
     app.router.add_get("/risk", get_risk_status)
+    app.router.add_get("/missed", get_missed_trades)
+    app.router.add_get("/daily", get_daily_pnl)
+    app.router.add_get("/debug", debug_positions)
+    app.router.add_post("/reset-prices", reset_entry_prices)
+    app.router.add_post("/backfill-prices", update_trade_prices)
+    app.router.add_post("/remove-fake-prices", remove_fake_prices)
+    app.router.add_post("/backfill-outcomes", backfill_outcomes)
     app.router.add_get("/reconcile", reconcile_positions)
+    app.router.add_post("/update-prices", trigger_price_update)
     app.router.add_get("/withdrawal", get_withdrawal_status)
     app.router.add_post("/withdrawal/trigger", trigger_withdrawal)
 
