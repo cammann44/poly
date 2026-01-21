@@ -1006,7 +1006,8 @@ class CigarettesTracker:
             self.monitor_onchain(),
             self.poll_data_api(),
             self.periodic_status(),
-            self.update_position_prices()
+            self.update_position_prices(),
+            self.periodic_resolution_check()
         ]
         if self.auto_withdrawal and self.auto_withdrawal.enabled:
             tasks.append(self.periodic_withdrawal_check())
@@ -1555,6 +1556,98 @@ class CigarettesTracker:
                     print(f"Auto-withdrawal completed: ${result.get('amount', 0):,.2f}")
                 elif result.get("status") not in ["disabled", "cooldown", "below_threshold"]:
                     print(f"Auto-withdrawal check: {result.get('status')}")
+
+    async def periodic_resolution_check(self):
+        """Check for resolved markets every 5 minutes and close positions."""
+        print("🏁 Starting resolution checker (every 5 min)...")
+        await asyncio.sleep(60)  # Initial delay
+
+        while self.running:
+            try:
+                headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+                resolved = 0
+                wins = 0
+                losses = 0
+                total_pnl = 0
+
+                positions_to_check = list(self.portfolio.positions.items())
+
+                async with aiohttp.ClientSession() as session:
+                    for token_id, pos in positions_to_check:
+                        try:
+                            url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+                            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    if data and len(data) > 0:
+                                        market = data[0]
+                                        is_closed = market.get("closed", False)
+                                        accepting_orders = market.get("acceptingOrders", True)
+
+                                        if is_closed and not accepting_orders:
+                                            clob_tokens = json.loads(market.get("clobTokenIds", "[]"))
+                                            outcome_prices = json.loads(market.get("outcomePrices", "[]"))
+
+                                            if token_id in clob_tokens:
+                                                idx = clob_tokens.index(token_id)
+                                                if idx < len(outcome_prices):
+                                                    resolution_price = float(outcome_prices[idx])
+                                                    entry_price = pos.get("entry_price", 0)
+                                                    shares = pos.get("size", 0)
+                                                    pnl = (resolution_price - entry_price) * shares
+
+                                                    # Create SELL trade
+                                                    sell_trade = {
+                                                        "timestamp": datetime.now().isoformat(),
+                                                        "wallet": pos.get("wallet", "unknown"),
+                                                        "trader": self.portfolio.position_wallet.get(token_id, "unknown"),
+                                                        "side": "SELL",
+                                                        "token_id": token_id,
+                                                        "market": pos.get("market", market.get("question", "Unknown")),
+                                                        "slug": market.get("slug", ""),
+                                                        "price": resolution_price,
+                                                        "size": pos.get("original_size", 0),
+                                                        "copy_size": pos.get("cost", 0),
+                                                        "trade_pnl": pnl,
+                                                        "outcome": "RESOLVED",
+                                                        "resolution": "WIN" if resolution_price >= 0.5 else "LOSS"
+                                                    }
+                                                    self.portfolio.trades.append(sell_trade)
+                                                    self.portfolio.realised_pnl += pnl
+                                                    total_pnl += pnl
+
+                                                    del self.portfolio.positions[token_id]
+                                                    if token_id in self.portfolio.position_prices:
+                                                        del self.portfolio.position_prices[token_id]
+                                                    if token_id in self.portfolio.position_price_times:
+                                                        del self.portfolio.position_price_times[token_id]
+
+                                                    resolved += 1
+                                                    if resolution_price >= 0.5:
+                                                        wins += 1
+                                                    else:
+                                                        losses += 1
+                        except:
+                            pass
+                        await asyncio.sleep(0.05)  # Small delay between checks
+
+                if resolved > 0:
+                    self.portfolio.balance += total_pnl
+                    # Save to log file
+                    with open(LOG_FILE, 'w') as f:
+                        for t in self.portfolio.trades:
+                            f.write(json.dumps(t) + "\n")
+
+                    REALISED_PNL.set(self.portfolio.realised_pnl)
+                    BALANCE.set(self.portfolio.balance)
+                    OPEN_POSITIONS.set(len(self.portfolio.positions))
+
+                    print(f"🏁 Resolved {resolved} markets | Wins: {wins} | Losses: {losses} | P&L: ${total_pnl:+,.2f}")
+
+            except Exception as e:
+                print(f"⚠ Resolution check error: {e}")
+
+            await asyncio.sleep(300)  # Check every 5 minutes
 
 
 async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal = None):
