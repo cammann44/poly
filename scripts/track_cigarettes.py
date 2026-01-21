@@ -438,6 +438,7 @@ class Portfolio:
 
         # Live price tracking for unrealised P&L
         self.position_prices = {}  # token_id -> current_price
+        self.position_price_times = {}  # token_id -> timestamp of last successful price fetch
         self.last_price_update = 0
 
         # Set system start time
@@ -1495,6 +1496,7 @@ class CigarettesTracker:
                             failed += 1
                         elif result is not None:
                             self.portfolio.position_prices[token_id] = result
+                            self.portfolio.position_price_times[token_id] = time.time()
                             updated += 1
                         else:
                             failed += 1
@@ -1697,6 +1699,12 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             # Get option name for multi-outcome markets
             option_name = trade.get("option_name")
 
+            # Calculate price age in minutes (only for open positions with live prices)
+            price_age_min = None
+            if status == "OPEN" and token_id in portfolio.position_price_times:
+                price_age_sec = time.time() - portfolio.position_price_times[token_id]
+                price_age_min = round(price_age_sec / 60, 1)
+
             all_trades.append({
                 "timestamp": format_timestamp(trade.get("timestamp", "")),
                 "status": status,
@@ -1711,9 +1719,124 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 "current": round(current_price, 4) if current_price else None,
                 "size": round(copy_size, 2),
                 "pnl": round(pnl, 2) if pnl is not None else None,
-                "pnl_pct": round(pnl_pct, 1) if pnl_pct is not None else None
+                "pnl_pct": round(pnl_pct, 1) if pnl_pct is not None else None,
+                "price_age_min": price_age_min  # Minutes since last price update (None if no live price)
             })
         return web.json_response(all_trades)
+
+    async def download_csv(request):
+        """Download trades as CSV for manual verification."""
+        import io
+        import csv
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        # Header row
+        writer.writerow([
+            "Trade Timestamp",
+            "Current Timestamp",
+            "Status",
+            "Side",
+            "Market",
+            "Option",
+            "Outcome",
+            "Buy Price",
+            "Current/Sold Price",
+            "Size ($)",
+            "P&L ($)",
+            "P&L %",
+            "Price Age (min)",
+            "Polymarket URL"
+        ])
+
+        open_positions = set(portfolio.positions.keys())
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for trade in portfolio.trades:
+            token_id = trade.get("token_id", "unknown")
+            side = trade.get("side")
+            trade_price = trade.get("price", 0)
+            copy_size = trade.get("copy_size", 0)
+            slug = trade.get("slug", "")
+            market_name = trade.get("market", "Unknown")
+            option_name = trade.get("option_name", "")
+            outcome = trade.get("outcome", "")
+
+            if side == "SELL":
+                status = "CLOSED"
+                entry_price = None
+                # Find original BUY price
+                for t in portfolio.trades:
+                    if t.get("token_id") == token_id and t.get("side") == "BUY":
+                        entry_price = t.get("price")
+                        if not outcome:
+                            outcome = t.get("outcome", "")
+                        break
+                current_price = trade_price  # Exit price
+            else:
+                entry_price = trade_price
+                if token_id in open_positions:
+                    status = "OPEN"
+                    current_price = portfolio.position_prices.get(token_id)
+                    if not current_price:
+                        current_price = entry_price  # Fallback
+                else:
+                    status = "CLOSED"
+                    # Find SELL price
+                    current_price = None
+                    for t in portfolio.trades:
+                        if t.get("token_id") == token_id and t.get("side") == "SELL":
+                            current_price = t.get("price")
+                            break
+                    if not current_price:
+                        current_price = entry_price
+
+            # Calculate P&L
+            if entry_price and current_price and entry_price > 0:
+                pnl = (current_price - entry_price) * (copy_size / entry_price)
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100
+            else:
+                pnl = 0
+                pnl_pct = 0
+
+            # Price age
+            price_age_min = ""
+            if status == "OPEN" and token_id in portfolio.position_price_times:
+                price_age_sec = time.time() - portfolio.position_price_times[token_id]
+                price_age_min = round(price_age_sec / 60, 1)
+
+            # Polymarket URL
+            poly_url = f"https://polymarket.com/event/{slug}" if slug else ""
+
+            writer.writerow([
+                trade.get("timestamp", ""),
+                now_str,
+                status,
+                side,
+                market_name,
+                option_name,
+                outcome,
+                round(entry_price, 4) if entry_price else "",
+                round(current_price, 4) if current_price else "",
+                round(copy_size, 2),
+                round(pnl, 2),
+                round(pnl_pct, 1),
+                price_age_min,
+                poly_url
+            ])
+
+        # Return CSV response
+        csv_content = output.getvalue()
+        output.close()
+
+        return web.Response(
+            text=csv_content,
+            content_type="text/csv",
+            headers={
+                "Content-Disposition": f"attachment; filename=polymarket_trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            }
+        )
 
     async def get_summary(request):
         """Return portfolio summary."""
@@ -2231,6 +2354,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                                         price = (float(bids[0]["price"]) + float(asks[0]["price"])) / 2
                                 if price and 0 < price < 1:
                                     portfolio.position_prices[token_id] = price
+                                    portfolio.position_price_times[token_id] = time.time()
                                     updated += 1
                                 else:
                                     failed += 1
@@ -2274,6 +2398,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_get("/trades", get_trades)
     app.router.add_get("/closed", get_closed_trades)
     app.router.add_get("/all", get_all_trades)
+    app.router.add_get("/download", download_csv)
     app.router.add_get("/summary", get_summary)
     app.router.add_get("/categories", get_categories)
     app.router.add_get("/wallets", get_wallets)
