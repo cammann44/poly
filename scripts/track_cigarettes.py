@@ -2285,7 +2285,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     async def get_root(request):
         return web.json_response({
             "service": "Polymarket Copy Trader",
-            "endpoints": ["/health", "/summary", "/categories", "/trades", "/all", "/closed", "/wallets", "/risk", "/missed", "/daily", "/reconcile", "/withdrawal", "/backfill-prices", "/prometheus"],
+            "endpoints": ["/health", "/summary", "/categories", "/trades", "/all", "/download", "/closed", "/wallets", "/risk", "/missed", "/daily", "/reconcile", "/withdrawal", "/backfill-prices", "/prometheus"],
             "status": "running"
         })
 
