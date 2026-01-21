@@ -1523,21 +1523,23 @@ class CigarettesTracker:
             await asyncio.sleep(120)  # Update every 2 minutes
 
     async def _fetch_token_price(self, token_id: str, headers: dict) -> float:
-        """Fetch current price for a single token."""
+        """Fetch current price for a single token using gamma API."""
         try:
-            url = f"https://clob.polymarket.com/book?token_id={token_id}"
+            # Use gamma API for accurate market-implied prices
+            url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
             async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if data.get("last_trade_price"):
-                        return float(data["last_trade_price"])
-                    # Fallback to mid price
-                    bids = data.get("bids", [])
-                    asks = data.get("asks", [])
-                    if bids and asks:
-                        best_bid = float(bids[0]["price"])
-                        best_ask = float(asks[-1]["price"])
-                        return (best_bid + best_ask) / 2
+                    if data and len(data) > 0:
+                        market = data[0]
+                        # Parse the JSON strings
+                        clob_tokens = json.loads(market.get("clobTokenIds", "[]"))
+                        outcome_prices = json.loads(market.get("outcomePrices", "[]"))
+
+                        if token_id in clob_tokens and outcome_prices:
+                            idx = clob_tokens.index(token_id)
+                            if idx < len(outcome_prices):
+                                return float(outcome_prices[idx])
         except:
             pass
         return None
