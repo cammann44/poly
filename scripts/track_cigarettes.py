@@ -2174,8 +2174,12 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                             data = await resp.json()
                             if data and len(data) > 0:
                                 market_data = data[0]
-                                clob_tokens = market_data.get("clobTokenIds", [])
-                                outcomes_list = market_data.get("outcomes", ["Yes", "No"])
+                                # Parse clobTokenIds and outcomes - they're JSON strings in the API
+                                clob_tokens_raw = market_data.get("clobTokenIds", "[]")
+                                outcomes_raw = market_data.get("outcomes", '["Yes", "No"]')
+                                clob_tokens = json.loads(clob_tokens_raw) if isinstance(clob_tokens_raw, str) else clob_tokens_raw
+                                outcomes_list = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+
                                 option_name = market_data.get("groupItemTitle")  # e.g., "SRZP"
                                 slug = market_data.get("slug", "")
                                 market_name = market_data.get("question", "")
