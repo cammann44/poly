@@ -540,12 +540,18 @@ class Portfolio:
                         pos["entry_price"] = pos["cost"] / pos["size"] if pos["size"] > 0 else price
                     else:
                         # Count all SELLs as closes
+                        # Use stored trade_pnl if available, otherwise calculate
+                        pnl = trade.get("trade_pnl", 0)
+
                         if token_id in self.positions:
                             pos = self.positions[token_id]
-                            sell_value = min(copy_size, pos["cost"])
-                            shares_sold = sell_value / price if price > 0 else 0
-                            cost_basis = shares_sold * pos["entry_price"]
-                            pnl = sell_value - cost_basis
+
+                            # If no trade_pnl stored, calculate it (legacy trades)
+                            if pnl == 0 and pos["entry_price"] > 0:
+                                entry_cost = trade.get("entry_cost", pos["cost"])
+                                shares_sold = entry_cost / pos["entry_price"] if pos["entry_price"] > 0 else 0
+                                pnl = (price - pos["entry_price"]) * shares_sold
+
                             self.realised_pnl += pnl
 
                             # Track PnL and wins/losses per wallet
@@ -558,16 +564,23 @@ class Portfolio:
                                 else:
                                     self.wallet_stats[pos_wallet]["losses"] += 1
 
+                            # Update position tracking
+                            entry_cost = trade.get("entry_cost", pos["cost"])
+                            shares_sold = entry_cost / pos["entry_price"] if pos["entry_price"] > 0 else 0
                             pos["size"] -= shares_sold
-                            pos["cost"] -= cost_basis
-                            if pos["size"] <= 0.01:
+                            pos["cost"] -= entry_cost
+                            if pos["size"] <= 0.01 or pos["cost"] <= 0.01:
                                 del self.positions[token_id]
                                 if token_id in self.position_wallet:
                                     del self.position_wallet[token_id]
                         else:
-                            # Orphan SELL - position opened before tracking started
-                            # Still count as closed for the wallet
+                            # Orphan SELL - use trade_pnl if available
+                            self.realised_pnl += pnl
                             self.wallet_stats[wallet_name]["closed"] += 1
+                            if pnl >= 0:
+                                self.wallet_stats[wallet_name]["wins"] += 1
+                            else:
+                                self.wallet_stats[wallet_name]["losses"] += 1
 
             # Calculate open positions per wallet
             for token_id, wallet_name in self.position_wallet.items():
@@ -1683,6 +1696,8 @@ class CigarettesTracker:
                                                     entry_price = pos.get("entry_price", 0)
                                                     shares = pos.get("size", 0)
                                                     pnl = (resolution_price - entry_price) * shares
+                                                    # Actual return = shares * resolution_price
+                                                    actual_return = shares * resolution_price
 
                                                     # Create SELL trade
                                                     sell_trade = {
@@ -1695,7 +1710,8 @@ class CigarettesTracker:
                                                         "slug": market.get("slug", ""),
                                                         "price": resolution_price,
                                                         "size": pos.get("original_size", 0),
-                                                        "copy_size": pos.get("cost", 0),
+                                                        "copy_size": actual_return,  # Store actual return, not cost
+                                                        "entry_cost": pos.get("cost", 0),  # Store original cost for reference
                                                         "trade_pnl": pnl,
                                                         "outcome": "RESOLVED",
                                                         "resolution": "WIN" if resolution_price >= 0.5 else "LOSS"
@@ -2207,6 +2223,46 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "message": "Trading unpaused - daily metrics reset to current portfolio value"
         })
 
+    async def recalculate_balance(request):
+        """Recalculate balance and realised P&L from trade log using trade_pnl values."""
+        old_balance = portfolio.balance
+        old_realised = portfolio.realised_pnl
+
+        # Calculate from trades
+        total_buy_cost = 0
+        total_sell_return = 0
+        total_pnl = 0
+
+        for trade in portfolio.trades:
+            copy_size = trade.get("copy_size", 0)
+            if trade["side"] == "BUY":
+                total_buy_cost += copy_size * 1.001  # with fee
+            else:
+                # For SELLs, use copy_size as return (should be actual_return now)
+                total_sell_return += copy_size * 0.999  # with fee
+                # Also sum trade_pnl for realised
+                total_pnl += trade.get("trade_pnl", 0)
+
+        new_balance = STARTING_BALANCE - total_buy_cost + total_sell_return
+        portfolio.balance = new_balance
+        portfolio.realised_pnl = total_pnl
+
+        # Update metrics
+        BALANCE.set(new_balance)
+        REALISED_PNL.set(total_pnl)
+
+        print(f"🔄 Recalculated: Balance ${old_balance:,.2f} → ${new_balance:,.2f}, Realised ${old_realised:,.2f} → ${total_pnl:,.2f}")
+
+        return web.json_response({
+            "success": True,
+            "old_balance": round(old_balance, 2),
+            "new_balance": round(new_balance, 2),
+            "old_realised_pnl": round(old_realised, 2),
+            "new_realised_pnl": round(total_pnl, 2),
+            "total_buy_cost": round(total_buy_cost, 2),
+            "total_sell_return": round(total_sell_return, 2)
+        })
+
     async def get_missed_trades(request):
         """Return missed trades for analysis."""
         # Calculate potential value for each missed trade
@@ -2517,6 +2573,8 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
 
                                             # Calculate P&L
                                             pnl = (resolution_price - entry_price) * shares
+                                            # Actual return = shares * resolution_price
+                                            actual_return = shares * resolution_price
 
                                             # Create a SELL trade to record the close
                                             sell_trade = {
@@ -2529,7 +2587,8 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                                                 "slug": market.get("slug", ""),
                                                 "price": resolution_price,
                                                 "size": pos.get("original_size", 0),
-                                                "copy_size": pos.get("cost", 0),
+                                                "copy_size": actual_return,  # Store actual return, not cost
+                                                "entry_cost": pos.get("cost", 0),  # Store original cost for reference
                                                 "trade_pnl": pnl,
                                                 "outcome": "RESOLVED",
                                                 "resolution": "WIN" if resolution_price >= 0.5 else "LOSS"
@@ -2809,6 +2868,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_get("/wallets", get_wallets)
     app.router.add_get("/risk", get_risk_status)
     app.router.add_post("/unpause", unpause_trading)
+    app.router.add_post("/recalculate", recalculate_balance)
     app.router.add_get("/missed", get_missed_trades)
     app.router.add_get("/daily", get_daily_pnl)
     app.router.add_get("/debug", debug_positions)
