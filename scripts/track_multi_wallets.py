@@ -3710,6 +3710,8 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
 
         # Rebuild wallet_stats from scratch
         portfolio.wallet_stats = {}
+        open_tokens = set(portfolio.positions.keys())
+
         for trade in portfolio.trades:
             wallet = trade.get("trader") or trade.get("wallet") or "unknown"
             if wallet not in portfolio.wallet_stats:
@@ -3717,24 +3719,18 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             portfolio.wallet_stats[wallet]["trades"] += 1
             portfolio.wallet_stats[wallet]["volume"] += trade.get("copy_size", 0)
 
-        # Count open positions per wallet
-        for token_id, pos in portfolio.positions.items():
-            wallet = pos.get("trader") or pos.get("wallet") or "unknown"
-            if wallet in portfolio.wallet_stats:
+            token_id = trade.get("token_id")
+            if trade.get("side") == "SELL":
+                # SELL trades are closures
+                portfolio.wallet_stats[wallet]["closed"] += 1
+                pnl = trade.get("pnl", 0) or trade.get("trade_pnl", 0) or 0
+                portfolio.wallet_stats[wallet]["pnl"] += pnl
+                if pnl >= 0:
+                    portfolio.wallet_stats[wallet]["wins"] += 1
+                else:
+                    portfolio.wallet_stats[wallet]["losses"] += 1
+            elif token_id in open_tokens:
                 portfolio.wallet_stats[wallet]["open"] += 1
-
-        # Count closed positions and wins/losses from closed_positions
-        for token_id, pos in portfolio.closed_positions.items():
-            wallet = pos.get("trader") or pos.get("wallet") or "unknown"
-            if wallet not in portfolio.wallet_stats:
-                portfolio.wallet_stats[wallet] = {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
-            portfolio.wallet_stats[wallet]["closed"] += 1
-            pnl = pos.get("realised_pnl", 0)
-            portfolio.wallet_stats[wallet]["pnl"] += pnl
-            if pnl >= 0:
-                portfolio.wallet_stats[wallet]["wins"] += 1
-            else:
-                portfolio.wallet_stats[wallet]["losses"] += 1
 
         if updated > 0:
             with open(LOG_FILE, 'w') as f:
