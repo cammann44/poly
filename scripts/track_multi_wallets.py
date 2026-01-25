@@ -3652,6 +3652,52 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "already_set": already_set
         })
 
+    async def purge_unknown_trades(request):
+        """Remove trades from unknown wallet that have no open positions."""
+        # Find token_ids with open positions
+        open_token_ids = set(portfolio.positions.keys())
+
+        # Filter out unknown trades that aren't in open positions
+        original_count = len(portfolio.trades)
+        kept_trades = []
+        removed = 0
+
+        for trade in portfolio.trades:
+            trader = trade.get("trader") or trade.get("wallet")
+            token_id = trade.get("token_id")
+
+            # Keep if: has a known trader OR has an open position
+            if trader and trader != "unknown":
+                kept_trades.append(trade)
+            elif token_id in open_token_ids:
+                kept_trades.append(trade)
+            else:
+                removed += 1
+
+        portfolio.trades = kept_trades
+
+        # Save updated trades
+        with open(LOG_FILE, 'w') as f:
+            for t in portfolio.trades:
+                f.write(json.dumps(t) + "\n")
+
+        # Rebuild daily P&L from remaining trades
+        portfolio.daily_pnl = {}
+        for trade in portfolio.trades:
+            ts = trade.get("timestamp", "")[:10]
+            if ts:
+                if ts not in portfolio.daily_pnl:
+                    portfolio.daily_pnl[ts] = {"pnl": 0, "trades": 0, "volume": 0, "wins": 0, "losses": 0}
+                portfolio.daily_pnl[ts]["trades"] += 1
+                portfolio.daily_pnl[ts]["volume"] += trade.get("copy_size", 0)
+
+        return web.json_response({
+            "status": "success",
+            "original_trades": original_count,
+            "removed": removed,
+            "remaining": len(portfolio.trades)
+        })
+
     async def resolve_ended_markets(request):
         """Check for resolved markets and close positions with final P&L."""
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -4006,6 +4052,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_post("/remove-fake-prices", remove_fake_prices)
     app.router.add_post("/backfill-outcomes", backfill_outcomes)
     app.router.add_post("/backfill-wallets", backfill_wallets)
+    app.router.add_post("/purge-unknown", purge_unknown_trades)
     app.router.add_post("/resolve", resolve_ended_markets)
     app.router.add_get("/reconcile", reconcile_positions)
     app.router.add_post("/update-prices", trigger_price_update)
