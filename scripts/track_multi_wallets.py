@@ -3530,6 +3530,114 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "failed": failed
         })
 
+    async def backfill_wallets(request):
+        """Backfill wallet/trader names for trades with unknown source.
+        Queries Polymarket API to find which tracked wallet made each trade.
+        """
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        updated = 0
+        failed = 0
+        already_set = 0
+
+        # Get trades that need wallet assignment
+        unknown_trades = []
+        for i, trade in enumerate(portfolio.trades):
+            trader = trade.get("trader") or trade.get("wallet")
+            if not trader or trader == "unknown":
+                unknown_trades.append((i, trade))
+            else:
+                already_set += 1
+
+        if not unknown_trades:
+            return web.json_response({
+                "status": "success",
+                "message": "No unknown trades to backfill",
+                "already_set": already_set
+            })
+
+        # Build lookup of all historical activity for each tracked wallet
+        wallet_activity = {}  # wallet_addr -> {token_id -> [(timestamp, side, size), ...]}
+
+        async with aiohttp.ClientSession() as session:
+            for wallet_addr, wallet_name in TRACKED_WALLETS.items():
+                wallet_activity[wallet_addr] = {}
+                try:
+                    # Query wallet's trade history
+                    url = f"https://data-api.polymarket.com/activity?user={wallet_addr}&limit=1000"
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for activity in data:
+                                token_id = activity.get("asset")
+                                if not token_id:
+                                    continue
+                                ts = activity.get("timestamp", "")
+                                side = activity.get("side", "").upper()
+                                size = float(activity.get("size", 0))
+                                if token_id not in wallet_activity[wallet_addr]:
+                                    wallet_activity[wallet_addr][token_id] = []
+                                wallet_activity[wallet_addr][token_id].append({
+                                    "timestamp": ts,
+                                    "side": side,
+                                    "size": size
+                                })
+                except Exception as e:
+                    print(f"Error fetching activity for {wallet_name}: {e}")
+
+        # Match unknown trades to wallets
+        for idx, trade in unknown_trades:
+            token_id = trade.get("token_id")
+            trade_ts = trade.get("timestamp", "")[:19]  # Truncate to seconds
+            trade_side = trade.get("side", "").upper()
+            original_size = trade.get("original_size", 0)
+
+            matched_wallet = None
+            best_match_score = 0
+
+            for wallet_addr, wallet_name in TRACKED_WALLETS.items():
+                token_trades = wallet_activity.get(wallet_addr, {}).get(token_id, [])
+                for wt in token_trades:
+                    wt_ts = wt["timestamp"][:19] if wt.get("timestamp") else ""
+                    # Match by timestamp proximity and side
+                    if wt["side"] == trade_side:
+                        # Check timestamp match (within 60 seconds)
+                        try:
+                            from datetime import datetime
+                            t1 = datetime.fromisoformat(trade_ts.replace("Z", ""))
+                            t2 = datetime.fromisoformat(wt_ts.replace("Z", ""))
+                            diff = abs((t1 - t2).total_seconds())
+                            if diff < 60:
+                                # Score based on size match and time proximity
+                                size_match = 1 - abs(wt["size"] - original_size) / max(wt["size"], original_size, 1)
+                                time_score = 1 - (diff / 60)
+                                score = size_match * 0.5 + time_score * 0.5
+                                if score > best_match_score:
+                                    best_match_score = score
+                                    matched_wallet = wallet_name
+                        except:
+                            pass
+
+            if matched_wallet:
+                portfolio.trades[idx]["trader"] = matched_wallet
+                portfolio.trades[idx]["wallet"] = matched_wallet
+                updated += 1
+            else:
+                failed += 1
+
+        # Save updates
+        if updated > 0:
+            with open(LOG_FILE, 'w') as f:
+                for t in portfolio.trades:
+                    f.write(json.dumps(t) + "\n")
+
+        return web.json_response({
+            "status": "success",
+            "unknown_found": len(unknown_trades),
+            "matched": updated,
+            "unmatched": failed,
+            "already_set": already_set
+        })
+
     async def resolve_ended_markets(request):
         """Check for resolved markets and close positions with final P&L."""
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -3883,6 +3991,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_post("/backfill-prices", update_trade_prices)
     app.router.add_post("/remove-fake-prices", remove_fake_prices)
     app.router.add_post("/backfill-outcomes", backfill_outcomes)
+    app.router.add_post("/backfill-wallets", backfill_wallets)
     app.router.add_post("/resolve", resolve_ended_markets)
     app.router.add_get("/reconcile", reconcile_positions)
     app.router.add_post("/update-prices", trigger_price_update)
