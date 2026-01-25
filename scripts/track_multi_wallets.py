@@ -3743,6 +3743,71 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "wallets_rebuilt": len(portfolio.wallet_stats)
         })
 
+    async def purge_orphan_sells(request):
+        """Remove SELL trades that have no corresponding BUY for same wallet+token."""
+        from collections import defaultdict
+
+        # Track buys per wallet+token
+        wallet_token_buys = defaultdict(set)
+        for trade in portfolio.trades:
+            if trade.get("side") == "BUY":
+                wallet = trade.get("trader") or trade.get("wallet") or "unknown"
+                token = trade.get("token_id", "")
+                wallet_token_buys[wallet].add(token)
+
+        # Filter out orphan SELLs
+        original_count = len(portfolio.trades)
+        kept_trades = []
+        removed = 0
+
+        for trade in portfolio.trades:
+            side = trade.get("side", "BUY")
+            if side == "SELL":
+                wallet = trade.get("trader") or trade.get("wallet") or "unknown"
+                token = trade.get("token_id", "")
+                # Keep SELL only if we have a BUY for same wallet+token
+                if token in wallet_token_buys.get(wallet, set()):
+                    kept_trades.append(trade)
+                else:
+                    removed += 1
+            else:
+                kept_trades.append(trade)
+
+        portfolio.trades = kept_trades
+
+        # Save and rebuild stats
+        with open(LOG_FILE, 'w') as f:
+            for t in portfolio.trades:
+                f.write(json.dumps(t) + "\n")
+
+        # Rebuild wallet_stats
+        portfolio.wallet_stats = {}
+        open_tokens = set(portfolio.positions.keys())
+        for trade in portfolio.trades:
+            wallet = trade.get("trader") or trade.get("wallet") or "unknown"
+            if wallet not in portfolio.wallet_stats:
+                portfolio.wallet_stats[wallet] = {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
+            portfolio.wallet_stats[wallet]["trades"] += 1
+            portfolio.wallet_stats[wallet]["volume"] += trade.get("copy_size", 0)
+            token_id = trade.get("token_id")
+            if trade.get("side") == "SELL":
+                portfolio.wallet_stats[wallet]["closed"] += 1
+                pnl = trade.get("pnl", 0) or trade.get("trade_pnl", 0) or 0
+                portfolio.wallet_stats[wallet]["pnl"] += pnl
+                if pnl >= 0:
+                    portfolio.wallet_stats[wallet]["wins"] += 1
+                else:
+                    portfolio.wallet_stats[wallet]["losses"] += 1
+            elif token_id in open_tokens:
+                portfolio.wallet_stats[wallet]["open"] += 1
+
+        return web.json_response({
+            "status": "success",
+            "original_trades": original_count,
+            "removed_orphan_sells": removed,
+            "remaining": len(portfolio.trades)
+        })
+
     async def resolve_ended_markets(request):
         """Check for resolved markets and close positions with final P&L."""
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -4099,6 +4164,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_post("/backfill-wallets", backfill_wallets)
     app.router.add_post("/purge-unknown", purge_unknown_trades)
     app.router.add_post("/assign-cigarettes", assign_unknown_to_cigarettes)
+    app.router.add_post("/purge-orphan-sells", purge_orphan_sells)
     app.router.add_post("/resolve", resolve_ended_markets)
     app.router.add_get("/reconcile", reconcile_positions)
     app.router.add_post("/update-prices", trigger_price_update)
