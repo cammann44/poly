@@ -158,11 +158,18 @@ if VOLUME_PATH.exists():
     LOG_FILE = VOLUME_PATH / "cigarettes_trades.json"
     WITHDRAWAL_LOG_FILE = VOLUME_PATH / "withdrawals.json"
     MISSED_TRADES_FILE = VOLUME_PATH / "missed_trades.json"
+    STATE_FILE = VOLUME_PATH / "tracker_state.json"
 else:
     LOG_FILE = Path(__file__).parent / "logs" / "cigarettes_trades.json"
     WITHDRAWAL_LOG_FILE = Path(__file__).parent / "logs" / "withdrawals.json"
     MISSED_TRADES_FILE = Path(__file__).parent / "logs" / "missed_trades.json"
+    STATE_FILE = Path(__file__).parent / "logs" / "tracker_state.json"
     LOG_FILE.parent.mkdir(exist_ok=True)
+
+# Health monitoring config
+HEALTH_CHECK_INTERVAL = 60  # Check every 60 seconds
+MAX_PAUSED_DURATION = 300  # Alert if paused > 5 minutes while profitable
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")  # Optional alerting
 
 
 class AutoWithdrawal:
@@ -415,6 +422,8 @@ class Portfolio:
         self.daily_start_value = STARTING_BALANCE  # For daily loss tracking
         self.trading_paused = False  # Pause on daily loss limit
         self.daily_reset_date = datetime.now().date()  # Track when we last reset daily metrics
+        self.paused_since = None  # Timestamp when trading was paused (for health monitoring)
+        self.last_health_alert = None  # Prevent alert spam
 
         # Per-wallet stats: wallet_name -> {trades, open, closed, pnl, volume, wins, losses}
         self.wallet_stats = {name: {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
@@ -608,6 +617,55 @@ class Portfolio:
                 print(f"   📊 Restored {len(self.missed_trades)} missed trades")
             except Exception as e:
                 print(f"   ⚠ Failed to restore missed trades: {e}")
+
+        # Restore persistent state (trading_paused, daily_start_value, etc.)
+        self._load_state()
+
+    def _save_state(self):
+        """Save critical state to file for persistence across restarts."""
+        try:
+            state = {
+                "trading_paused": self.trading_paused,
+                "daily_start_value": self.daily_start_value,
+                "daily_reset_date": self.daily_reset_date.isoformat(),
+                "paused_since": self.paused_since.isoformat() if self.paused_since else None,
+                "last_updated": datetime.now().isoformat()
+            }
+            with open(STATE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print(f"⚠ Failed to save state: {e}")
+
+    def _load_state(self):
+        """Load persistent state from file."""
+        if not STATE_FILE.exists():
+            print("   No saved state file found, using defaults")
+            return
+
+        try:
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+
+            saved_date = datetime.fromisoformat(state.get("daily_reset_date", "2000-01-01")).date()
+            today = datetime.now().date()
+
+            # Only restore if same day, otherwise start fresh
+            if saved_date == today:
+                self.trading_paused = state.get("trading_paused", False)
+                self.daily_start_value = state.get("daily_start_value", self.daily_start_value)
+                self.daily_reset_date = saved_date
+                if state.get("paused_since"):
+                    self.paused_since = datetime.fromisoformat(state["paused_since"])
+                print(f"   📁 Restored state: paused={self.trading_paused}, daily_start=${self.daily_start_value:,.2f}")
+            else:
+                print(f"   📁 State file from {saved_date}, starting fresh for {today}")
+                # New day - use current portfolio value as daily start
+                pv = self.get_portfolio_value()
+                self.daily_start_value = pv
+                self.trading_paused = False
+                self.daily_reset_date = today
+        except Exception as e:
+            print(f"   ⚠ Failed to load state: {e}")
 
     def copy_trade(self, trade_data: dict) -> bool:
         """Copy a real trade from a tracked wallet."""
@@ -824,8 +882,10 @@ class Portfolio:
             print(f"🌅 Daily reset: new day {today}")
             self.daily_start_value = portfolio_value  # Start fresh from current value
             self.trading_paused = False  # Reset pause flag
+            self.paused_since = None
             self.daily_reset_date = today
             self.daily_volume = 0  # Reset daily volume too
+            self._save_state()
 
         # Check daily loss limit
         daily_pnl = portfolio_value - self.daily_start_value
@@ -833,10 +893,14 @@ class Portfolio:
         if daily_pnl < -STARTING_BALANCE * DAILY_LOSS_LIMIT:
             if not self.trading_paused:
                 self.trading_paused = True
+                self.paused_since = datetime.now()
+                self._save_state()
                 print(f"🚨 DAILY LOSS LIMIT REACHED: ${daily_pnl:+,.2f}")
         elif self.trading_paused and daily_pnl >= 0:
             # Resume trading if we've recovered to break-even or better
             self.trading_paused = False
+            self.paused_since = None
+            self._save_state()
             print(f"✅ Trading resumed - daily P&L recovered: ${daily_pnl:+,.2f}")
 
         # Update performance metrics
@@ -1030,7 +1094,8 @@ class CigarettesTracker:
             self.poll_data_api(),
             self.periodic_status(),
             self.update_position_prices(),
-            self.periodic_resolution_check()
+            self.periodic_resolution_check(),
+            self.health_monitor()
         ]
         if self.auto_withdrawal and self.auto_withdrawal.enabled:
             tasks.append(self.periodic_withdrawal_check())
@@ -1671,6 +1736,61 @@ class CigarettesTracker:
                 print(f"⚠ Resolution check error: {e}")
 
             await asyncio.sleep(300)  # Check every 5 minutes
+
+    async def health_monitor(self):
+        """Monitor system health and send alerts for anomalies."""
+        print("🏥 Starting health monitor...")
+        await asyncio.sleep(30)  # Initial delay
+
+        while self.running:
+            try:
+                pv = self.portfolio.get_portfolio_value()
+                daily_pnl = pv - self.portfolio.daily_start_value
+
+                # Check for stuck paused state while profitable
+                if self.portfolio.trading_paused and self.portfolio.paused_since:
+                    paused_duration = (datetime.now() - self.portfolio.paused_since).total_seconds()
+
+                    # Alert if paused > 5 min but we're in profit
+                    if paused_duration > MAX_PAUSED_DURATION and daily_pnl >= 0:
+                        # Auto-fix: unpause since we're profitable
+                        self.portfolio.trading_paused = False
+                        self.portfolio.paused_since = None
+                        self.portfolio._save_state()
+                        alert_msg = f"🔧 Auto-fixed: Trading was paused for {paused_duration/60:.1f}min while profitable (${daily_pnl:+,.2f}). Unpaused."
+                        print(alert_msg)
+                        await self._send_alert(alert_msg)
+
+                # Check for large unrealised loss (potential issue)
+                unrealised = self.portfolio.get_unrealised_pnl()
+                if unrealised < -5000:  # Alert on $5k+ unrealised loss
+                    now = datetime.now()
+                    if not self.portfolio.last_health_alert or (now - self.portfolio.last_health_alert).total_seconds() > 3600:
+                        alert_msg = f"⚠️ Large unrealised loss: ${unrealised:,.2f}"
+                        print(alert_msg)
+                        await self._send_alert(alert_msg)
+                        self.portfolio.last_health_alert = now
+
+                # Periodic state save (every health check cycle)
+                self.portfolio._save_state()
+
+            except Exception as e:
+                print(f"⚠ Health monitor error: {e}")
+
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+
+    async def _send_alert(self, message: str):
+        """Send alert via Discord webhook if configured."""
+        if not DISCORD_WEBHOOK_URL:
+            return
+
+        try:
+            payload = {"content": f"**Poly Tracker Alert**\n{message}"}
+            async with self.session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 204:
+                    print(f"⚠ Discord alert failed: {resp.status}")
+        except Exception as e:
+            print(f"⚠ Failed to send alert: {e}")
 
 
 async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal = None):
@@ -2558,13 +2678,29 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         pv = portfolio.get_portfolio_value()
         exposure = sum(p["cost"] for p in portfolio.positions.values())
         uptime = (datetime.now() - portfolio.start_time).total_seconds()
+        daily_pnl = pv - portfolio.daily_start_value
 
         # Check if API polling is working (trades in last 10 minutes)
         recent_trades = [t for t in portfolio.trades[-20:] if t.get("timestamp")]
         api_healthy = len(recent_trades) > 0
 
+        # Calculate paused duration if applicable
+        paused_duration = None
+        paused_but_profitable = False
+        if portfolio.trading_paused and portfolio.paused_since:
+            paused_duration = (datetime.now() - portfolio.paused_since).total_seconds()
+            paused_but_profitable = daily_pnl >= 0
+
+        # Determine overall health status
+        if portfolio.trading_paused and paused_but_profitable:
+            status = "warning"  # Paused while profitable is concerning
+        elif not api_healthy:
+            status = "degraded"
+        else:
+            status = "healthy"
+
         return web.json_response({
-            "status": "healthy" if api_healthy else "degraded",
+            "status": status,
             "uptime_seconds": round(uptime),
             "websocket_connected": WEBSOCKET_CONNECTED._value._value if hasattr(WEBSOCKET_CONNECTED, '_value') else 0,
             "total_trades": len(portfolio.trades),
@@ -2572,13 +2708,18 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "missed_trades": len(portfolio.missed_trades),
             "portfolio_value": round(pv, 2),
             "exposure_pct": round(exposure / STARTING_BALANCE * 100, 1),
+            "daily_pnl": round(daily_pnl, 2),
             "log_file": str(LOG_FILE),
+            "state_file": str(STATE_FILE),
             "volume_mounted": VOLUME_PATH.exists(),
             "checks": {
                 "api_polling": api_healthy,
                 "log_writable": LOG_FILE.parent.exists(),
+                "state_writable": STATE_FILE.parent.exists(),
                 "kill_switch": check_kill_switch(),
-                "trading_paused": portfolio.trading_paused
+                "trading_paused": portfolio.trading_paused,
+                "paused_duration_sec": round(paused_duration) if paused_duration else None,
+                "paused_but_profitable": paused_but_profitable
             }
         })
 
