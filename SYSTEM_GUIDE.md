@@ -25,7 +25,7 @@ This is a **paper trading** bot that simulates copying trades from successful Po
 
 | Component | Purpose | Location |
 |-----------|---------|----------|
-| `track_cigarettes.py` | Main bot - monitors wallets, simulates trades | `scripts/` |
+| `track_multi_wallets.py` | Main bot - monitors wallets, simulates trades | `scripts/` |
 | Trade Log | Stores all simulated trades | `/app/data/poly_trades.json` |
 | State File | Persists trading_paused, daily values | `/app/data/tracker_state.json` |
 | Grafana | Visual dashboard | Railway (separate service) |
@@ -64,7 +64,7 @@ When markets close:
 ```
 poly/
 ├── scripts/
-│   └── track_cigarettes.py    # Main bot (2800+ lines)
+│   └── track_multi_wallets.py    # Main bot (2800+ lines)
 ├── logs/
 │   └── poly_trades.json # Local trade log (outdated)
 ├── grafana/
@@ -88,17 +88,17 @@ poly/
 1. **Edit code locally**
    ```bash
    cd /home/ybrid22/projects/hybrid/poly
-   # Make changes to scripts/track_cigarettes.py
+   # Make changes to scripts/track_multi_wallets.py
    ```
 
 2. **Test syntax**
    ```bash
-   python3 -m py_compile scripts/track_cigarettes.py
+   python3 -m py_compile scripts/track_multi_wallets.py
    ```
 
 3. **Commit changes**
    ```bash
-   git add scripts/track_cigarettes.py
+   git add scripts/track_multi_wallets.py
    git commit -m "Description of changes"
    ```
 
@@ -179,7 +179,7 @@ curl -X POST https://tracker-production-e869.up.railway.app/recalculate
 | `COLD_WALLET_ADDRESS` | Not used (paper trading) |
 | `HOT_WALLET_PRIVATE_KEY` | Not used (paper trading) |
 
-### Code Constants (track_cigarettes.py)
+### Code Constants (track_multi_wallets.py)
 
 ```python
 STARTING_BALANCE = 75000      # Initial paper balance

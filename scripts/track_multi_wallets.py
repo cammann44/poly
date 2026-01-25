@@ -909,20 +909,23 @@ class Portfolio:
                     "category": category,
                     "outcome": outcome
                 }
-            self.position_wallet[token_id] = wallet_name
-            self.wallet_stats[wallet_name]["open"] += 1
-        pos = self.positions[token_id]
-        pos["cost"] += copy_size
-        pos["size"] += copy_size / price if price > 0 else 0
-        pos["entry_price"] = pos["cost"] / pos["size"] if pos["size"] > 0 else price
-        pos["market"] = market
-        pos["slug"] = slug
-        pos["category"] = category
-        if outcome:
-            pos["outcome"] = outcome
-            # Track peak value for trailing stop-loss
-            current_value = pos["size"] * price
-            self.position_peaks[token_id] = max(self.position_peaks.get(token_id, 0), current_value)
+                self.position_wallet[token_id] = wallet_name
+                self.wallet_stats[wallet_name]["open"] += 1
+                pos = self.positions[token_id]
+                pos["cost"] += copy_size
+                pos["size"] += copy_size / price if price > 0 else 0
+                pos["entry_price"] = pos["cost"] / pos["size"] if pos["size"] > 0 else price
+                pos["market"] = market
+                pos["slug"] = slug
+                pos["category"] = category
+                if outcome:
+                    pos["outcome"] = outcome
+                # Track peak value for trailing stop-loss
+                current_value = pos["size"] * price
+                self.position_peaks[token_id] = max(self.position_peaks.get(token_id, 0), current_value)
+                # Record price timestamp for age calculations
+                self.position_prices[token_id] = price
+                self.position_price_times[token_id] = time.time()
         else:
             if token_id in self.positions:
                 pos = self.positions[token_id]

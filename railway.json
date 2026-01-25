@@ -5,7 +5,7 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "startCommand": "python track_cigarettes.py",
+    "startCommand": "python track_multi_wallets.py",
     "healthcheckPath": "/summary",
     "healthcheckTimeout": 30,
     "restartPolicyType": "ON_FAILURE"

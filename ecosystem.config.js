@@ -2,7 +2,7 @@ module.exports = {
   apps: [
     {
       name: 'poly-tracker',
-      script: 'track_cigarettes.py',
+      script: 'track_multi_wallets.py',
       cwd: '/home/ybrid22/projects/hybrid/poly/scripts',
       interpreter: 'python3',
       watch: false,
