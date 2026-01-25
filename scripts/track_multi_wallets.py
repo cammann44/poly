@@ -66,7 +66,7 @@ async def retry_with_backoff(coro_func, max_retries=5, base_delay=1, max_delay=6
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FILE = REPO_ROOT / "config" / "wallets.json"
 KILL_SWITCH_FILE = REPO_ROOT / "config" / "KILL_SWITCH"
-STARTING_BALANCE = 75000  # $75k
+STARTING_BALANCE = 200000  # $200k
 COPY_RATIO = 0.1  # Copy 10% of their trade size
 MAX_COPY_SIZE = 500  # Max $500 per trade
 MIN_COPY_SIZE = 10  # Min $10 per trade
