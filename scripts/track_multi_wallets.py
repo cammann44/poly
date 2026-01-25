@@ -65,7 +65,9 @@ async def retry_with_backoff(coro_func, max_retries=5, base_delay=1, max_delay=6
     raise last_error
 
 # ============== CONFIG ==============
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# Handle both local dev (script in scripts/) and container (script in /app)
+_script_dir = Path(__file__).resolve().parent
+REPO_ROOT = _script_dir.parent if _script_dir.name == "scripts" else _script_dir
 CONFIG_FILE = REPO_ROOT / "config" / "wallets.json"
 KILL_SWITCH_FILE = REPO_ROOT / "config" / "KILL_SWITCH"
 STARTING_BALANCE = 200000  # $200k
