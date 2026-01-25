@@ -3284,6 +3284,40 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             })
         return web.json_response(daily_data)
 
+    async def get_trades_timeline(request):
+        """Return trade counts grouped by hour for time series visualization."""
+        from collections import defaultdict
+        hourly_counts = defaultdict(lambda: {"buys": 0, "sells": 0, "volume": 0})
+
+        for trade in portfolio.trades:
+            ts = trade.get("timestamp", "")
+            if not ts:
+                continue
+            # Extract hour (truncate to hour)
+            hour_str = ts[:13] + ":00:00"  # "2026-01-25T17:00:00"
+            side = trade.get("side", "BUY")
+            size = trade.get("copy_size", 0)
+
+            if side == "BUY":
+                hourly_counts[hour_str]["buys"] += 1
+            else:
+                hourly_counts[hour_str]["sells"] += 1
+            hourly_counts[hour_str]["volume"] += size
+
+        # Convert to sorted list
+        timeline = []
+        for hour_str in sorted(hourly_counts.keys()):
+            data = hourly_counts[hour_str]
+            timeline.append({
+                "timestamp": hour_str,
+                "buys": data["buys"],
+                "sells": data["sells"],
+                "total": data["buys"] + data["sells"],
+                "volume": round(data["volume"], 2)
+            })
+
+        return web.json_response(timeline)
+
     async def reset_entry_prices(request):
         """Reset entry prices to current prices for positions with default 0.5 price.
         This zeros out unrealised P&L but gives accurate going-forward tracking.
@@ -3690,7 +3724,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     async def get_root(request):
         return web.json_response({
             "service": "Polymarket Copy Trader",
-            "endpoints": ["/health", "/summary", "/categories", "/trades", "/all", "/download", "/closed", "/wallets", "/risk", "/missed", "/daily", "/reconcile", "/withdrawal", "/backfill-prices", "/prometheus"],
+            "endpoints": ["/health", "/summary", "/categories", "/trades", "/all", "/download", "/closed", "/wallets", "/risk", "/missed", "/daily", "/timeline", "/reconcile", "/withdrawal", "/backfill-prices", "/prometheus"],
             "status": "running"
         })
 
@@ -3843,6 +3877,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_post("/recalculate", recalculate_balance)
     app.router.add_get("/missed", get_missed_trades)
     app.router.add_get("/daily", get_daily_pnl)
+    app.router.add_get("/timeline", get_trades_timeline)
     app.router.add_get("/debug", debug_positions)
     app.router.add_post("/reset-prices", reset_entry_prices)
     app.router.add_post("/backfill-prices", update_trade_prices)

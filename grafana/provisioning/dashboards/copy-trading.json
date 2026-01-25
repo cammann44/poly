@@ -138,14 +138,14 @@
       "type": "timeseries"
     },
     {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "stepAfter", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}},
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "infinity"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "fillOpacity": 80, "gradientMode": "hue", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineWidth": 1, "scaleDistribution": {"type": "linear"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": [{"matcher": {"id": "byName", "options": "buys"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]}, {"matcher": {"id": "byName", "options": "sells"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}]},
       "gridPos": {"h": 6, "w": 12, "x": 12, "y": 3},
       "id": 13,
-      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-      "targets": [{"expr": "poly_trades_executed_total", "legendFormat": "Trades", "refId": "A"}, {"expr": "poly_open_positions", "legendFormat": "Open", "refId": "B"}],
-      "title": "Trading Activity",
-      "type": "timeseries"
+      "options": {"barRadius": 0.1, "barWidth": 0.8, "fullHighlight": false, "groupWidth": 0.7, "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "orientation": "vertical", "showValue": "never", "stacking": "normal", "tooltip": {"mode": "multi", "sort": "desc"}, "xTickLabelRotation": -45, "xTickLabelSpacing": 100},
+      "targets": [{"columns": [{"selector": "timestamp", "text": "timestamp", "type": "timestamp"}, {"selector": "buys", "text": "buys", "type": "number"}, {"selector": "sells", "text": "sells", "type": "number"}], "format": "table", "refId": "A", "source": "url", "type": "json", "url": "https://tracker-production-e869.up.railway.app/timeline", "url_options": {"method": "GET"}}],
+      "title": "Copied Trades (Hourly)",
+      "type": "barchart"
     },
     {
       "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "infinity"},
