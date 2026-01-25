@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Track @cigarettes on Polymarket - REAL TRADES via On-Chain + API
+Track target Polymarket wallets via on-chain + API data sources.
 
-Monitors the actual wallet via multiple methods:
+Monitors multiple wallets concurrently using:
 1. On-chain ERC1155 transfers (Conditional Tokens)
 2. Polymarket data API
 3. WebSocket (backup)
-
-Wallet: 0xd218e474776403a330142299f7796e8ba32eb5c9
-Profile: https://polymarket.com/@cigarettes
 """
 
 import asyncio
 import json
 import time
 import os
+import fcntl
 from datetime import datetime
 from pathlib import Path
 
@@ -33,9 +31,41 @@ except ImportError:
     from web3 import Web3
     from eth_account import Account
 
+# ============== RETRY UTILITY ==============
+async def retry_with_backoff(coro_func, max_retries=5, base_delay=1, max_delay=60, context="operation"):
+    """Retry an async function with exponential backoff.
+
+    Args:
+        coro_func: Async function to call (no arguments)
+        max_retries: Maximum retry attempts
+        base_delay: Initial delay in seconds
+        max_delay: Maximum delay between retries
+        context: Description for error messages
+
+    Returns:
+        Result of coro_func on success
+
+    Raises:
+        Last exception if all retries fail
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return await coro_func()
+        except Exception as e:
+            last_error = e
+            if attempt == max_retries - 1:
+                print(f"🚨 {context} failed after {max_retries} attempts: {e}")
+                raise
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            print(f"⚠ {context} failed (attempt {attempt+1}/{max_retries}), retrying in {delay}s: {e}")
+            await asyncio.sleep(delay)
+    raise last_error
+
 # ============== CONFIG ==============
-CONFIG_FILE = Path(__file__).parent / "config" / "wallets.json"
-KILL_SWITCH_FILE = Path(__file__).parent / "config" / "KILL_SWITCH"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_FILE = REPO_ROOT / "config" / "wallets.json"
+KILL_SWITCH_FILE = REPO_ROOT / "config" / "KILL_SWITCH"
 STARTING_BALANCE = 75000  # $75k
 COPY_RATIO = 0.1  # Copy 10% of their trade size
 MAX_COPY_SIZE = 500  # Max $500 per trade
@@ -155,12 +185,12 @@ WORST_TRADER_PNL = Gauge('poly_worst_trader_pnl_usd', 'Worst trader PnL', ['wall
 # Use Railway volume if available, fallback to local
 VOLUME_PATH = Path("/app/data")
 if VOLUME_PATH.exists():
-    LOG_FILE = VOLUME_PATH / "cigarettes_trades.json"
+    LOG_FILE = VOLUME_PATH / "poly_trades.json"
     WITHDRAWAL_LOG_FILE = VOLUME_PATH / "withdrawals.json"
     MISSED_TRADES_FILE = VOLUME_PATH / "missed_trades.json"
     STATE_FILE = VOLUME_PATH / "tracker_state.json"
 else:
-    LOG_FILE = Path(__file__).parent / "logs" / "cigarettes_trades.json"
+    LOG_FILE = Path(__file__).parent / "logs" / "poly_trades.json"
     WITHDRAWAL_LOG_FILE = Path(__file__).parent / "logs" / "withdrawals.json"
     MISSED_TRADES_FILE = Path(__file__).parent / "logs" / "missed_trades.json"
     STATE_FILE = Path(__file__).parent / "logs" / "tracker_state.json"
@@ -442,6 +472,7 @@ class Portfolio:
 
         # Missed trades tracking
         self.missed_trades = []  # Store trades blocked by limits
+        self.missed_trades_total = 0
 
         # Daily P&L tracking: date_str -> {pnl, trades, volume, wins, losses}
         self.daily_pnl = {}
@@ -450,6 +481,17 @@ class Portfolio:
         self.position_prices = {}  # token_id -> current_price
         self.position_price_times = {}  # token_id -> timestamp of last successful price fetch
         self.last_price_update = 0
+
+        # Error tracking for monitoring
+        self.error_counts = {
+            "api_failures": 0,
+            "ws_disconnects": 0,
+            "price_fetch_failures": 0,
+            "state_save_failures": 0,
+            "resolution_failures": 0
+        }
+        self.error_timestamps = {}  # error_type -> list of timestamps for windowed rate limiting
+        self.alert_throttle = {}  # severity -> last alert timestamp
 
         # Set system start time
         SYSTEM_START_TIME.set(time.time())
@@ -495,7 +537,7 @@ class Portfolio:
 
         # Seed volume with bundled log if volume is empty
         if VOLUME_PATH.exists() and not LOG_FILE.exists():
-            bundled_log = Path(__file__).parent / "logs" / "cigarettes_trades.json"
+            bundled_log = Path(__file__).parent / "logs" / "poly_trades.json"
             if bundled_log.exists():
                 print(f"Seeding volume from bundled log: {bundled_log}")
                 import shutil
@@ -520,7 +562,7 @@ class Portfolio:
                     copy_size = trade.get("copy_size", 10)
                     price = trade.get("price", 0.5)
                     market = trade.get("market", "Unknown")
-                    wallet_name = trade.get("trader", "cigarettes")  # Default to cigarettes for old trades
+                    wallet_name = trade.get("trader", next(iter(TRACKED_WALLETS.values()), "unknown"))
 
                     # Ensure wallet exists in stats
                     if wallet_name not in self.wallet_stats:
@@ -590,22 +632,30 @@ class Portfolio:
             # Rebuild daily P&L from trade history
             for trade in self.trades:
                 ts = trade.get("timestamp", "")
-                if ts:
-                    try:
-                        trade_date = ts[:10]  # Extract YYYY-MM-DD
-                        if trade_date not in self.daily_pnl:
-                            self.daily_pnl[trade_date] = {"pnl": 0.0, "trades": 0, "volume": 0.0, "wins": 0, "losses": 0}
-                        self.daily_pnl[trade_date]["trades"] += 1
-                        self.daily_pnl[trade_date]["volume"] += trade.get("copy_size", 0)
-                        trade_pnl = trade.get("trade_pnl", 0)
-                        if trade["side"] == "SELL":
-                            self.daily_pnl[trade_date]["pnl"] += trade_pnl
-                            if trade_pnl >= 0:
-                                self.daily_pnl[trade_date]["wins"] += 1
-                            else:
-                                self.daily_pnl[trade_date]["losses"] += 1
-                    except:
-                        pass
+                if not ts:
+                    continue
+                try:
+                    trade_date = ts[:10]  # Extract YYYY-MM-DD
+                    if trade_date not in self.daily_pnl:
+                        self.daily_pnl[trade_date] = {
+                            "pnl": 0.0,
+                            "trades": 0,
+                            "volume": 0.0,
+                            "wins": 0,
+                            "losses": 0,
+                            "timestamp": self._get_day_timestamp(trade_date)
+                        }
+                    self.daily_pnl[trade_date]["trades"] += 1
+                    self.daily_pnl[trade_date]["volume"] += trade.get("copy_size", 0)
+                    trade_pnl = trade.get("trade_pnl", 0)
+                    if trade["side"] == "SELL":
+                        self.daily_pnl[trade_date]["pnl"] += trade_pnl
+                        if trade_pnl >= 0:
+                            self.daily_pnl[trade_date]["wins"] += 1
+                        else:
+                            self.daily_pnl[trade_date]["losses"] += 1
+                except Exception as e:
+                    print(f"   ⚠ Error parsing trade for daily P&L: {e}")
             print(f"   📅 Rebuilt daily P&L for {len(self.daily_pnl)} days")
 
             # Calculate final balance
@@ -627,15 +677,56 @@ class Portfolio:
                     for line in f:
                         if line.strip():
                             self.missed_trades.append(json.loads(line))
-                print(f"   📊 Restored {len(self.missed_trades)} missed trades")
+                self.missed_trades_total = len(self.missed_trades)
+                print(f"   📊 Restored {len(self.missed_trades)} missed trades (total {self.missed_trades_total})")
             except Exception as e:
                 print(f"   ⚠ Failed to restore missed trades: {e}")
 
         # Restore persistent state (trading_paused, daily_start_value, etc.)
         self._load_state()
 
+    def record_error(self, error_type: str, threshold: int = 5, window_minutes: int = 5) -> bool:
+        """Record an error and return True if threshold exceeded in window.
+
+        Args:
+            error_type: Category of error (api_failures, ws_disconnects, etc.)
+            threshold: Number of errors before alerting
+            window_minutes: Time window for counting errors
+
+        Returns:
+            True if threshold exceeded (should alert), False otherwise
+        """
+        now = time.time()
+        self.error_counts[error_type] = self.error_counts.get(error_type, 0) + 1
+
+        # Track timestamps for windowed rate
+        if error_type not in self.error_timestamps:
+            self.error_timestamps[error_type] = []
+        self.error_timestamps[error_type].append(now)
+
+        # Clean old timestamps outside window
+        cutoff = now - (window_minutes * 60)
+        self.error_timestamps[error_type] = [t for t in self.error_timestamps[error_type] if t > cutoff]
+
+        # Return True if threshold exceeded in window
+        return len(self.error_timestamps[error_type]) >= threshold
+
+    def get_error_stats(self) -> dict:
+        """Get current error statistics for /errors endpoint."""
+        now = time.time()
+        stats = {}
+        for error_type, count in self.error_counts.items():
+            timestamps = self.error_timestamps.get(error_type, [])
+            # Count errors in last 5 minutes
+            recent = len([t for t in timestamps if t > now - 300])
+            stats[error_type] = {
+                "total": count,
+                "last_5_min": recent
+            }
+        return stats
+
     def _save_state(self):
-        """Save critical state to file for persistence across restarts."""
+        """Save critical state to file with file locking for safety."""
         try:
             state = {
                 "trading_paused": self.trading_paused,
@@ -645,9 +736,17 @@ class Portfolio:
                 "last_updated": datetime.now().isoformat()
             }
             with open(STATE_FILE, "w") as f:
-                json.dump(state, f, indent=2)
+                # Use exclusive lock to prevent concurrent writes
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    json.dump(state, f, indent=2)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except Exception as e:
-            print(f"⚠ Failed to save state: {e}")
+            if self.record_error("state_save_failures"):
+                print(f"🚨 CRITICAL: Repeated state save failures: {e}")
+            else:
+                print(f"⚠ Failed to save state: {e}")
 
     def _load_state(self):
         """Load persistent state from file."""
@@ -679,6 +778,17 @@ class Portfolio:
                 self.daily_reset_date = today
         except Exception as e:
             print(f"   ⚠ Failed to load state: {e}")
+
+    def _get_day_timestamp(self, date_str: str) -> int:
+        """Return a unix timestamp for the start of the given date (YYYY-MM-DD)."""
+        try:
+            date_obj = datetime.fromisoformat(date_str)
+        except ValueError:
+            try:
+                date_obj = datetime.fromisoformat(f"{date_str}T00:00:00")
+            except ValueError:
+                return int(datetime.now().timestamp())
+        return int(datetime(date_obj.year, date_obj.month, date_obj.day).timestamp())
 
     def copy_trade(self, trade_data: dict) -> bool:
         """Copy a real trade from a tracked wallet."""
@@ -775,6 +885,7 @@ class Portfolio:
                     }
                     self.missed_trades.append(missed_trade)
                     self._log_missed_trade(missed_trade)
+                    self.missed_trades_total += 1
                     return False
 
         fee = copy_size * 0.001
@@ -789,13 +900,26 @@ class Portfolio:
             self.balance -= cost
 
             if token_id not in self.positions:
-                self.positions[token_id] = {"size": 0, "cost": 0, "market": market, "entry_price": price}
-                self.position_wallet[token_id] = wallet_name
-                self.wallet_stats[wallet_name]["open"] += 1
-            pos = self.positions[token_id]
-            pos["cost"] += copy_size
-            pos["size"] += copy_size / price if price > 0 else 0
-            pos["entry_price"] = pos["cost"] / pos["size"] if pos["size"] > 0 else price
+                self.positions[token_id] = {
+                    "size": 0,
+                    "cost": 0,
+                    "market": market,
+                    "entry_price": price,
+                    "slug": slug,
+                    "category": category,
+                    "outcome": outcome
+                }
+            self.position_wallet[token_id] = wallet_name
+            self.wallet_stats[wallet_name]["open"] += 1
+        pos = self.positions[token_id]
+        pos["cost"] += copy_size
+        pos["size"] += copy_size / price if price > 0 else 0
+        pos["entry_price"] = pos["cost"] / pos["size"] if pos["size"] > 0 else price
+        pos["market"] = market
+        pos["slug"] = slug
+        pos["category"] = category
+        if outcome:
+            pos["outcome"] = outcome
             # Track peak value for trailing stop-loss
             current_value = pos["size"] * price
             self.position_peaks[token_id] = max(self.position_peaks.get(token_id, 0), current_value)
@@ -862,32 +986,9 @@ class Portfolio:
         ORDERS_SUCCESS.inc()
         if side == "SELL":
             CLOSED_TRADES.inc()
-        BALANCE.set(self.balance)
-        DAILY_VOLUME.set(self.daily_volume)
-        REALISED_PNL.set(self.realised_pnl)
-        OPEN_POSITIONS.set(len(self.positions))
 
         exposure = sum(p["cost"] for p in self.positions.values())
         portfolio_value = self.balance + exposure
-        TOTAL_EXPOSURE.set(exposure)
-        PORTFOLIO_VALUE.set(portfolio_value)
-        UNREALISED_PNL.set(self.get_unrealised_pnl())  # True unrealised from live prices
-
-        # Update per-wallet metrics
-        for wname, stats in self.wallet_stats.items():
-            WALLET_TRADES.labels(wallet=wname).set(stats["trades"])
-            WALLET_OPEN.labels(wallet=wname).set(stats["open"])
-            WALLET_CLOSED.labels(wallet=wname).set(stats["closed"])
-            WALLET_PNL.labels(wallet=wname).set(stats["pnl"])
-            WALLET_VOLUME.labels(wallet=wname).set(stats["volume"])
-            # Calculate win rate
-            total_closed = stats["wins"] + stats["losses"]
-            win_rate = stats["wins"] / total_closed if total_closed > 0 else 0.5
-            WALLET_WIN_RATE.labels(wallet=wname).set(win_rate)
-
-        # Update risk metrics
-        KILL_SWITCH_ACTIVE.set(1 if check_kill_switch() else 0)
-        TRADING_PAUSED.set(1 if self.trading_paused else 0)
 
         # Check for daily reset (midnight rollover)
         today = datetime.now().date()
@@ -902,7 +1003,6 @@ class Portfolio:
 
         # Check daily loss limit
         daily_pnl = portfolio_value - self.daily_start_value
-        DAILY_PNL.set(daily_pnl)
         if daily_pnl < -STARTING_BALANCE * DAILY_LOSS_LIMIT:
             if not self.trading_paused:
                 self.trading_paused = True
@@ -916,34 +1016,10 @@ class Portfolio:
             self._save_state()
             print(f"✅ Trading resumed - daily P&L recovered: ${daily_pnl:+,.2f}")
 
-        # Update performance metrics
         # Track latency (keep last 100)
         self.latencies.append(latency)
         if len(self.latencies) > 100:
             self.latencies.pop(0)
-        avg_latency = sum(self.latencies) / len(self.latencies)
-        COPY_LATENCY_AVG.set(avg_latency)
-
-        # ROI
-        roi = ((portfolio_value - STARTING_BALANCE) / STARTING_BALANCE) * 100
-        ROI_PERCENT.set(roi)
-
-        # Overall win rate
-        total_wins = sum(s["wins"] for s in self.wallet_stats.values())
-        total_losses = sum(s["losses"] for s in self.wallet_stats.values())
-        overall_win_rate = total_wins / (total_wins + total_losses) if (total_wins + total_losses) > 0 else 0.5
-        WIN_RATE.set(overall_win_rate)
-
-        # 24h change
-        CHANGE_24H.set(portfolio_value - self.value_24h_ago)
-
-        # Best/worst trader
-        if self.wallet_stats:
-            best = max(self.wallet_stats.items(), key=lambda x: x[1]["pnl"])
-            worst = min(self.wallet_stats.items(), key=lambda x: x[1]["pnl"])
-            BEST_TRADER_PNL.labels(wallet=best[0]).set(best[1]["pnl"])
-            WORST_TRADER_PNL.labels(wallet=worst[0]).set(worst[1]["pnl"])
-
         # Category stats
         if category not in self.category_stats:
             self.category_stats[category] = {"trades": 0, "pnl": 0.0, "volume": 0.0}
@@ -955,7 +1031,14 @@ class Portfolio:
         # Daily P&L tracking
         today = datetime.now().strftime("%Y-%m-%d")
         if today not in self.daily_pnl:
-            self.daily_pnl[today] = {"pnl": 0.0, "trades": 0, "volume": 0.0, "wins": 0, "losses": 0}
+            self.daily_pnl[today] = {
+                "pnl": 0.0,
+                "trades": 0,
+                "volume": 0.0,
+                "wins": 0,
+                "losses": 0,
+                "timestamp": self._get_day_timestamp(today)
+            }
         self.daily_pnl[today]["trades"] += 1
         self.daily_pnl[today]["volume"] += copy_size
         if side == "SELL":
@@ -964,6 +1047,7 @@ class Portfolio:
                 self.daily_pnl[today]["wins"] += 1
             else:
                 self.daily_pnl[today]["losses"] += 1
+        self._refresh_metrics()
 
         return True
 
@@ -975,25 +1059,146 @@ class Portfolio:
         with open(MISSED_TRADES_FILE, "a") as f:
             f.write(json.dumps(trade) + "\n")
 
-    def check_stop_losses(self, price_fetcher) -> list:
-        """Check positions for trailing stop-loss triggers. Returns list of tokens to sell."""
-        stop_loss_triggers = []
+    def _refresh_metrics(self):
+        """Update all Prometheus metrics that depend on portfolio state."""
+        BALANCE.set(self.balance)
+        DAILY_VOLUME.set(self.daily_volume)
+        REALISED_PNL.set(self.realised_pnl)
+        OPEN_POSITIONS.set(len(self.positions))
+
+        exposure = sum(p["cost"] for p in self.positions.values())
+        portfolio_value = self.balance + exposure
+        TOTAL_EXPOSURE.set(exposure)
+        PORTFOLIO_VALUE.set(portfolio_value)
+        UNREALISED_PNL.set(self.get_unrealised_pnl())
+
+        roi = ((portfolio_value - STARTING_BALANCE) / STARTING_BALANCE) * 100
+        ROI_PERCENT.set(roi)
+
+        avg_latency = sum(self.latencies) / len(self.latencies) if self.latencies else 0
+        COPY_LATENCY_AVG.set(avg_latency)
+
+        total_wins = sum(s["wins"] for s in self.wallet_stats.values())
+        total_losses = sum(s["losses"] for s in self.wallet_stats.values())
+        overall_win_rate = total_wins / (total_wins + total_losses) if (total_wins + total_losses) > 0 else 0.5
+        WIN_RATE.set(overall_win_rate)
+
+        CHANGE_24H.set(portfolio_value - self.value_24h_ago)
+
+        if self.wallet_stats:
+            best = max(self.wallet_stats.items(), key=lambda x: x[1]["pnl"])
+            worst = min(self.wallet_stats.items(), key=lambda x: x[1]["pnl"])
+            BEST_TRADER_PNL.labels(wallet=best[0]).set(best[1]["pnl"])
+            WORST_TRADER_PNL.labels(wallet=worst[0]).set(worst[1]["pnl"])
+
+        for wname, stats in self.wallet_stats.items():
+            WALLET_TRADES.labels(wallet=wname).set(stats["trades"])
+            WALLET_OPEN.labels(wallet=wname).set(stats["open"])
+            WALLET_CLOSED.labels(wallet=wname).set(stats["closed"])
+            WALLET_PNL.labels(wallet=wname).set(stats["pnl"])
+            WALLET_VOLUME.labels(wallet=wname).set(stats["volume"])
+            total_closed = stats["wins"] + stats["losses"]
+            win_rate = stats["wins"] / total_closed if total_closed > 0 else 0.5
+            WALLET_WIN_RATE.labels(wallet=wname).set(win_rate)
+
+        KILL_SWITCH_ACTIVE.set(1 if check_kill_switch() else 0)
+        TRADING_PAUSED.set(1 if self.trading_paused else 0)
+
+        DAILY_PNL.set(portfolio_value - self.daily_start_value)
+
+    def check_stop_losses(self) -> list:
+        """Check positions for trailing stop-loss triggers using live prices."""
+        triggers = []
         for token_id, pos in list(self.positions.items()):
-            if token_id not in self.position_peaks:
+            peak = self.position_peaks.get(token_id)
+            current_price = self.position_prices.get(token_id)
+            if not peak or not current_price:
                 continue
-            peak = self.position_peaks[token_id]
-            current_value = pos["cost"]  # Using cost as proxy for value
-            if peak > 0:
-                drawdown = (peak - current_value) / peak
-                if drawdown >= TRAILING_STOP_LOSS:
-                    stop_loss_triggers.append({
-                        "token_id": token_id,
-                        "market": pos["market"],
-                        "drawdown": drawdown,
-                        "peak": peak,
-                        "current": current_value
-                    })
-        return stop_loss_triggers
+            current_value = pos.get("size", 0) * current_price
+            if peak <= 0:
+                continue
+            drawdown = (peak - current_value) / peak
+            if drawdown >= TRAILING_STOP_LOSS:
+                triggers.append({
+                    "token_id": token_id,
+                    "market": pos.get("market", "Unknown"),
+                    "drawdown": drawdown,
+                    "peak": peak,
+                    "current_price": current_price
+                })
+        return triggers
+
+    def force_close_position(self, token_id: str, price: float, reason: str = "trailing_stop_loss") -> bool:
+        """Force-close a position (used for trailing stop-loss or manual exits)."""
+        pos = self.positions.pop(token_id, None)
+        if not pos or price is None or price <= 0:
+            return False
+
+        shares = pos.get("size", 0)
+        if shares <= 0:
+            return False
+
+        entry_price = pos.get("entry_price", price)
+        wallet_name = self.position_wallet.pop(token_id, "unknown")
+        proceeds = shares * price
+        fee = proceeds * 0.001
+        trade_pnl = (price - entry_price) * shares
+
+        self.realised_pnl += trade_pnl
+        self.balance += max(0, proceeds - fee)
+        self.daily_volume += proceeds
+        self.wallet_stats.setdefault(wallet_name, {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0,
+                                                   "volume": 0.0, "wins": 0, "losses": 0})
+        stats = self.wallet_stats[wallet_name]
+        stats["pnl"] += trade_pnl
+        stats["closed"] += 1
+        stats["open"] = max(0, stats["open"] - 1)
+        stats["volume"] += proceeds
+        if trade_pnl >= 0:
+            stats["wins"] += 1
+        else:
+            stats["losses"] += 1
+
+        if token_id in self.position_peaks:
+            del self.position_peaks[token_id]
+        self.position_prices.pop(token_id, None)
+        self.position_price_times.pop(token_id, None)
+
+        trade_record = {
+            "timestamp": datetime.now().isoformat(),
+            "side": "SELL",
+            "market": pos.get("market", "Unknown"),
+            "category": pos.get("category", "Other"),
+            "token_id": token_id,
+            "slug": pos.get("slug", ""),
+            "outcome": pos.get("outcome"),
+            "original_size": pos.get("cost", 0),
+            "copy_size": shares * price,
+            "price": price,
+            "balance_after": self.balance,
+            "pnl": self.realised_pnl,
+            "trader": wallet_name,
+            "trade_pnl": trade_pnl,
+            "manual_close_reason": reason
+        }
+        self.trades.append(trade_record)
+        self._log_trade(trade_record)
+
+        CLOSED_TRADES.inc()
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today not in self.daily_pnl:
+            self.daily_pnl[today] = {"pnl": 0.0, "trades": 0, "volume": 0.0, "wins": 0, "losses": 0}
+        self.daily_pnl[today]["trades"] += 1
+        self.daily_pnl[today]["volume"] += shares * price
+        self.daily_pnl[today]["pnl"] += trade_pnl
+        if trade_pnl >= 0:
+            self.daily_pnl[today]["wins"] += 1
+        else:
+            self.daily_pnl[today]["losses"] += 1
+
+        self._refresh_metrics()
+        return True
 
     def get_wallet_win_rates(self) -> dict:
         """Get win rates for all wallets."""
@@ -1066,8 +1271,8 @@ class Portfolio:
         print("=" * 70)
 
 
-class CigarettesTracker:
-    """Monitor @cigarettes wallet via multiple data sources."""
+class MultiWalletTracker:
+    """Monitor tracked wallets via multiple data sources."""
 
     def __init__(self, portfolio: Portfolio, auto_withdrawal: AutoWithdrawal = None):
         self.portfolio = portfolio
@@ -1134,10 +1339,12 @@ class CigarettesTracker:
         # ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
         return
 
+        ws_reconnect_attempts = 0
         while self.running:
             try:
                 async with websockets.connect(ws_url, ping_interval=30) as ws:
                     WEBSOCKET_CONNECTED.set(1)
+                    ws_reconnect_attempts = 0  # Reset on successful connection
                     print("✅ WebSocket connected")
 
                     # Subscribe to each tracked wallet
@@ -1167,7 +1374,11 @@ class CigarettesTracker:
                 WEBSOCKET_CONNECTED.set(0)
                 print(f"⚠ WebSocket error: {e}")
 
-            await asyncio.sleep(5)  # Wait before reconnecting
+            # Exponential backoff for reconnection
+            ws_reconnect_attempts += 1
+            delay = min(5 * (2 ** min(ws_reconnect_attempts - 1, 5)), 60)  # 5s -> 10s -> 20s -> 40s -> 60s max
+            print(f"   Waiting {delay}s before reconnect attempt {ws_reconnect_attempts}...")
+            await asyncio.sleep(delay)
 
     async def handle_ws_message(self, data: dict):
         """Handle incoming WebSocket message."""
@@ -1437,8 +1648,8 @@ class CigarettesTracker:
                                 series_title = event["series"][0].get("title", "").lower()
                                 if any(s in series_title for s in ["nba", "nfl", "mlb", "nhl", "ufc", "pga", "tennis", "soccer", "football"]):
                                     category = "Sports"
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠ Error fetching category from gamma API for {token_id[:20]}: {e}")
 
         # If no category from API, use detect_category helper
         if not category or category == "Other":
@@ -1453,8 +1664,8 @@ class CigarettesTracker:
                         data = await resp.json()
                         if not market_name or market_name.startswith("Token"):
                             market_name = data.get("question", market_name)
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠ Error fetching from CLOB API for {condition_id}: {e}")
 
         # Cache the result
         self.price_cache[token_id] = {
@@ -1477,8 +1688,8 @@ class CigarettesTracker:
                     data = await resp.json()
                     if data and len(data) > 0:
                         return data[0].get("question", f"Token {token_id[:20]}...")
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠ Error fetching market name for {token_id[:20]}: {e}")
         return f"Token {token_id[:20]}..."
 
     async def poll_data_api(self):
@@ -1490,6 +1701,7 @@ class CigarettesTracker:
         last_seen = {addr: 0 for addr in TRACKED_WALLETS}
         poll_count = 0
 
+        api_backoff = 10
         while self.running:
             try:
                 poll_count += 1
@@ -1553,10 +1765,12 @@ class CigarettesTracker:
 
                                     # Update last_seen after processing each trade
                                     last_seen[wallet_addr] = ts
+                api_backoff = 10
+                await asyncio.sleep(10)  # Poll every 10 seconds
             except Exception as e:
                 print(f"⚠ API polling error: {e}")
-
-            await asyncio.sleep(10)  # Poll every 10 seconds
+                await asyncio.sleep(api_backoff)
+                api_backoff = min(api_backoff * 2, 60)
 
     async def periodic_status(self):
         """Print status periodically."""
@@ -1572,6 +1786,7 @@ class CigarettesTracker:
         print("💰 Starting position price updater (every 2 min)...")
         await asyncio.sleep(10)  # Initial delay to let things start
 
+        price_backoff = 10
         while self.running:
             try:
                 positions = list(self.portfolio.positions.keys())
@@ -1599,6 +1814,10 @@ class CigarettesTracker:
                         elif result is not None:
                             self.portfolio.position_prices[token_id] = result
                             self.portfolio.position_price_times[token_id] = time.time()
+                            pos = self.portfolio.positions.get(token_id)
+                            if pos:
+                                current_value = pos.get("size", 0) * result
+                                self.portfolio.position_peaks[token_id] = max(self.portfolio.position_peaks.get(token_id, 0), current_value)
                             updated += 1
                         else:
                             failed += 1
@@ -1609,6 +1828,13 @@ class CigarettesTracker:
 
                 self.portfolio.last_price_update = time.time()
 
+                triggers = self.portfolio.check_stop_losses()
+                for trigger in triggers:
+                    token_id = trigger["token_id"]
+                    price = trigger["current_price"]
+                    print(f"🚨 Trailing stop-loss triggered for {trigger['market']} (drawdown {trigger['drawdown']:.1%})")
+                    self.portfolio.force_close_position(token_id, price)
+
                 # Update metrics with live prices
                 unrealised = self.portfolio.get_unrealised_pnl()
                 pv = self.portfolio.get_portfolio_value()
@@ -1618,11 +1844,12 @@ class CigarettesTracker:
                 ROI_PERCENT.set(roi)
 
                 print(f"💰 Updated {updated}/{len(positions)} prices | Unrealised P&L: ${unrealised:+,.2f}")
-
+                price_backoff = 10
+                await asyncio.sleep(120)  # Update every 2 minutes
             except Exception as e:
                 print(f"⚠ Price update error: {e}")
-
-            await asyncio.sleep(120)  # Update every 2 minutes
+                await asyncio.sleep(price_backoff)
+                price_backoff = min(price_backoff * 2, 60)
 
     async def _fetch_token_price(self, token_id: str, headers: dict) -> float:
         """Fetch current price for a single token using gamma API."""
@@ -1642,8 +1869,8 @@ class CigarettesTracker:
                             idx = clob_tokens.index(token_id)
                             if idx < len(outcome_prices):
                                 return float(outcome_prices[idx])
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠ Error fetching price from gamma API: {e}")
         return None
 
     async def periodic_withdrawal_check(self):
@@ -1731,8 +1958,8 @@ class CigarettesTracker:
                                                         wins += 1
                                                     else:
                                                         losses += 1
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f"⚠ Error checking resolution for {token_id[:20]}: {e}")
                         await asyncio.sleep(0.05)  # Small delay between checks
 
                 if resolved > 0:
@@ -1795,13 +2022,40 @@ class CigarettesTracker:
 
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
-    async def _send_alert(self, message: str):
-        """Send alert via Discord webhook if configured."""
+    async def _send_alert(self, message: str, severity: str = "warning"):
+        """Send alert with severity levels and throttling.
+
+        Args:
+            message: Alert message
+            severity: 'info', 'warning', or 'critical'
+        """
+        severity_config = {
+            "info": {"emoji": "ℹ️", "throttle_seconds": 300},      # Max 1 per 5 min
+            "warning": {"emoji": "⚠️", "throttle_seconds": 120},   # Max 1 per 2 min
+            "critical": {"emoji": "🚨", "throttle_seconds": 0}     # Always send
+        }
+
+        config = severity_config.get(severity, severity_config["warning"])
+        emoji = config["emoji"]
+        throttle = config["throttle_seconds"]
+
+        # Log to console always
+        print(f"{emoji} [{severity.upper()}] {message}")
+
+        # Check throttling (critical always sends)
+        now = time.time()
+        if throttle > 0:
+            last_alert = self.portfolio.alert_throttle.get(severity, 0)
+            if now - last_alert < throttle:
+                return  # Throttled
+            self.portfolio.alert_throttle[severity] = now
+
+        # Send to Discord if configured
         if not DISCORD_WEBHOOK_URL:
             return
 
         try:
-            payload = {"content": f"**Poly Tracker Alert**\n{message}"}
+            payload = {"content": f"{emoji} **{severity.upper()}** - Poly Tracker\n{message}"}
             async with self.session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 204:
                     print(f"⚠ Discord alert failed: {resp.status}")
@@ -1852,7 +2106,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         try:
             dt = datetime.fromisoformat(iso_timestamp.replace('Z', '+00:00'))
             return dt.strftime("%b %d, %H:%M")
-        except:
+        except Exception:
             return iso_timestamp[:16] if iso_timestamp else ""
 
     async def get_all_trades(request):
@@ -1872,6 +2126,12 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                     "timestamp": trade.get("timestamp", ""),
                     "outcome": trade.get("outcome")
                 })
+
+        def _normalize_price(value, fallback=0.0):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return fallback
 
         for trade in reversed(portfolio.trades):  # Most recent first
             token_id = trade.get("token_id", "unknown")
@@ -1897,10 +2157,10 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                     pnl = (exit_price - entry_price) * (copy_size / exit_price) if exit_price > 0 else 0
                     pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                 else:
-                    pnl = trade.get("trade_pnl", 0)
-                    pnl_pct = None
+                    pnl = trade.get("trade_pnl", 0) or 0.0
+                    pnl_pct = 0.0
 
-                current_price = exit_price  # Show exit price as "current" for closed trades
+                current_price = exit_price or entry_price  # Show exit price as "current" for closed trades
             else:
                 # BUY trade
                 entry_price = trade_price
@@ -1930,7 +2190,6 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                         pnl = (sell_price - entry_price) * (copy_size / entry_price)
                         pnl_pct = ((sell_price - entry_price) / entry_price) * 100
                     else:
-                        # No sell price found - show 0 P&L
                         pnl = 0.0
                         pnl_pct = 0.0
 
@@ -1944,14 +2203,15 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 if price_for_outcome:
                     outcome = "Yes" if price_for_outcome >= 0.5 else "No"
 
-            slug = trade.get("slug", "")
-            market_name = trade.get("market", "Unknown")
-            category = trade.get("category")
-            if not category or category == "Other":
-                category = detect_category(market_name, slug)
+            slug = trade.get("slug") or ""
+            market_name = trade.get("market") or "Unknown"
+            category = trade.get("category") or detect_category(market_name, slug)
+            option_name = trade.get("option_name") or ""
 
-            # Get option name for multi-outcome markets
-            option_name = trade.get("option_name")
+            entry_price = entry_price if entry_price else _normalize_price(trade.get("price"))
+            current_price = current_price if current_price else entry_price
+            pnl = pnl if pnl is not None else 0.0
+            pnl_pct = pnl_pct if pnl_pct is not None else 0.0
 
             # Calculate price age in minutes (only for open positions with live prices)
             price_age_min = None
@@ -2338,8 +2598,8 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                             data = await resp.json()
                             if data.get("last_trade_price"):
                                 current_price = float(data["last_trade_price"])
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠ Error fetching missed trade price: {e}")
 
             intended_size = trade.get("intended_size", 0)
             potential_pnl = (current_price - entry_price) * (intended_size / entry_price) if entry_price > 0 else 0
@@ -2358,6 +2618,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "total_missed": len(portfolio.missed_trades),
             "total_missed_volume": round(total_missed_volume, 2),
             "total_potential_pnl": round(total_potential_pnl, 2),
+            "total_missed_logged": portfolio.missed_trades_total,
             "trades": missed_with_current[-100:]  # Last 100 missed trades
         })
 
@@ -2371,6 +2632,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             win_rate = day["wins"] / (day["wins"] + day["losses"]) if (day["wins"] + day["losses"]) > 0 else 0
             daily_data.append({
                 "date": date_str,
+                "timestamp": day.get("timestamp"),
                 "pnl": round(day["pnl"], 2),
                 "cumulative_pnl": round(cumulative_pnl, 2),
                 "trades": day["trades"],
@@ -2575,7 +2837,8 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                                         if market_name and (not trade.get("market") or trade.get("market", "").startswith("Token ")):
                                             trade["market"] = market_name
                                         updated += 1
-                except:
+                except Exception as e:
+                    print(f"⚠ Error backfilling outcome for token: {e}")
                     failed += 1
 
                 await asyncio.sleep(0.1)  # Rate limit
@@ -2840,6 +3103,14 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             }
         })
 
+    async def get_errors(request):
+        """Return error statistics for monitoring."""
+        return web.json_response({
+            "errors": portfolio.get_error_stats(),
+            "alert_throttle": {k: round(time.time() - v) for k, v in portfolio.alert_throttle.items()},
+            "timestamp": datetime.now().isoformat()
+        })
+
     async def get_metrics(request):
         """Prometheus metrics endpoint."""
         from prometheus_client import generate_latest
@@ -2882,7 +3153,8 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                                     failed += 1
                             else:
                                 failed += 1
-                    except:
+                    except Exception as e:
+                        print(f"⚠ Error refreshing price for {token_id[:20]}: {e}")
                         failed += 1
 
                 # Small delay between batches
@@ -2916,6 +3188,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app = web.Application()
     app.router.add_get("/", get_root)
     app.router.add_get("/health", get_health)
+    app.router.add_get("/errors", get_errors)
     app.router.add_get("/prometheus", get_metrics)
     app.router.add_get("/trades", get_trades)
     app.router.add_get("/closed", get_closed_trades)
@@ -2964,7 +3237,7 @@ async def main():
     auto_withdrawal = AutoWithdrawal()
 
     portfolio = Portfolio()
-    tracker = CigarettesTracker(portfolio, auto_withdrawal)
+    tracker = MultiWalletTracker(portfolio, auto_withdrawal)
 
     # Start trades API
     await run_trades_api(portfolio, auto_withdrawal)

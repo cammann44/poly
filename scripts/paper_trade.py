@@ -40,6 +40,7 @@ class PaperTrade:
     size: float
     price: float
     fee: float
+    pnl: float = 0.0  # Set when trade closes a position
 
 
 class PaperTradingEngine:
@@ -83,14 +84,24 @@ class PaperTradingEngine:
 
         self.total_fees += fee
 
-        # Record trade
+        # Calculate PnL if this trade closes/reduces a position
+        trade_pnl = 0.0
+        if market_id in self.positions:
+            pos = self.positions[market_id]
+            if pos.side != side:
+                # This trade reduces/closes the position - calculate PnL
+                close_size = min(size, pos.size)
+                trade_pnl = self._calculate_pnl(pos, price, close_size)
+
+        # Record trade with PnL
         trade = PaperTrade(
             timestamp=time.time(),
             market_id=market_id,
             side=side,
             size=size,
             price=price,
-            fee=fee
+            fee=fee,
+            pnl=trade_pnl
         )
         self.trades.append(trade)
 
@@ -106,8 +117,7 @@ class PaperTradingEngine:
                 # Reduce or close position
                 if size >= pos.size:
                     # Close and potentially open opposite
-                    pnl = self._calculate_pnl(pos, price, pos.size)
-                    self.realised_pnl += pnl
+                    self.realised_pnl += trade_pnl
                     remaining = size - pos.size
                     del self.positions[market_id]
                     if remaining > 0:
@@ -120,8 +130,7 @@ class PaperTradingEngine:
                             opened_at=time.time()
                         )
                 else:
-                    pnl = self._calculate_pnl(pos, price, size)
-                    self.realised_pnl += pnl
+                    self.realised_pnl += trade_pnl
                     pos.size -= size
         else:
             # New position
@@ -186,8 +195,8 @@ class PaperTradingEngine:
         }
 
     def _get_trade_pnl(self, trade: PaperTrade) -> float:
-        """Estimate trade PnL (simplified)."""
-        return 0  # Would need exit trade to calculate
+        """Get trade PnL (stored when trade closes a position)."""
+        return trade.pnl
 
     def print_summary(self):
         """Print trading summary."""

@@ -26,7 +26,7 @@ This is a **paper trading** bot that simulates copying trades from successful Po
 | Component | Purpose | Location |
 |-----------|---------|----------|
 | `track_cigarettes.py` | Main bot - monitors wallets, simulates trades | `scripts/` |
-| Trade Log | Stores all simulated trades | `/app/data/cigarettes_trades.json` |
+| Trade Log | Stores all simulated trades | `/app/data/poly_trades.json` |
 | State File | Persists trading_paused, daily values | `/app/data/tracker_state.json` |
 | Grafana | Visual dashboard | Railway (separate service) |
 | Prometheus | Metrics collection | Railway (separate service) |
@@ -66,7 +66,7 @@ poly/
 ├── scripts/
 │   └── track_cigarettes.py    # Main bot (2800+ lines)
 ├── logs/
-│   └── cigarettes_trades.json # Local trade log (outdated)
+│   └── poly_trades.json # Local trade log (outdated)
 ├── grafana/
 │   └── provisioning/
 │       └── dashboards/
@@ -138,6 +138,7 @@ The bot exposes a REST API on port 8765:
 |----------|---------|
 | `/summary` | Portfolio overview (balance, P&L, ROI) |
 | `/health` | System health check |
+| `/errors` | Error statistics and alert throttle status |
 | `/trades` | Raw trade log |
 | `/all` | All trades formatted for display |
 | `/risk` | Risk status (paused, exposure) |
@@ -240,7 +241,7 @@ curl https://tracker-production-e869.up.railway.app/health | python3 -m json.too
 
 ## Tracked Wallets
 
-Configured in `scripts/config/wallets.json`:
+Configured in `config/wallets.json`:
 - cigarettes (primary)
 - DrPufferfish
 - gmanas
