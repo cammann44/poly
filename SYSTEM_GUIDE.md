@@ -27,6 +27,7 @@ This is a **paper trading** bot that simulates copying trades from successful Po
 |-----------|---------|----------|
 | `track_multi_wallets.py` | Main bot - monitors wallets, simulates trades | `scripts/` |
 | Trade Log | Stores all simulated trades | `/app/data/poly_trades.json` |
+| Trade DB | SQLite checkpoint store for trades | `/app/data/poly_trades.db` |
 | State File | Persists trading_paused, daily values | `/app/data/tracker_state.json` |
 | Grafana | Visual dashboard | Railway (separate service) |
 | Prometheus | Metrics collection | Railway (separate service) |
@@ -178,11 +179,17 @@ curl -X POST https://tracker-production-e869.up.railway.app/recalculate
 | `DISCORD_WEBHOOK_URL` | Optional: alerts for issues |
 | `COLD_WALLET_ADDRESS` | Not used (paper trading) |
 | `HOT_WALLET_PRIVATE_KEY` | Not used (paper trading) |
+| `BACKFILL_ENABLED` | Enable API backfill after downtime (default: true) |
+| `BACKFILL_LOOKBACK_HOURS` | How far back to scan for missed trades (default: 24) |
+| `DATA_API_LIMIT` | Trades per poll to reduce misses (default: 50) |
+| `DATABASE_URL` | **Required on Railway**: Postgres connection string (auto-provided) |
+| `SEEN_TRADES_TTL_SECONDS` | Dedupe cache TTL in seconds (default: 86400) |
+| `SEEN_TRADES_MAX` | Max size of dedupe cache (default: 50000) |
 
 ### Code Constants (track_multi_wallets.py)
 
 ```python
-STARTING_BALANCE = 75000      # Initial paper balance
+STARTING_BALANCE = 200000     # Initial paper balance
 COPY_RATIO = 0.1              # Copy 10% of trader's size
 MAX_COPY_SIZE = 500           # Max $500 per trade
 MIN_COPY_SIZE = 10            # Min $10 per trade
@@ -251,7 +258,7 @@ Configured in `config/wallets.json`:
 ## Key Concepts
 
 ### Paper Balance
-Starts at $75,000. Goes down when "buying", up when "selling".
+Starts at $200,000. Goes down when "buying", up when "selling".
 
 ### Exposure
 Total $ amount in open positions (cost basis).

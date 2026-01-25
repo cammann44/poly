@@ -12,6 +12,8 @@ import asyncio
 import json
 import time
 import os
+import sqlite3
+from collections import OrderedDict
 import fcntl
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +78,14 @@ MAX_PORTFOLIO_EXPOSURE = 1.0  # Max 100% of capital in positions
 TRAILING_STOP_LOSS = 0.20  # Exit if position drops 20% from peak
 DAILY_LOSS_LIMIT = 0.10  # Stop trading if daily loss exceeds 10%
 MIN_WALLET_WIN_RATE = 0.40  # Reduce copy ratio if wallet win rate < 40%
+
+# Backfill settings (for reliability after downtime)
+BACKFILL_ENABLED = os.environ.get("BACKFILL_ENABLED", "true").lower() in ["1", "true", "yes"]
+BACKFILL_LOOKBACK_HOURS = int(os.environ.get("BACKFILL_LOOKBACK_HOURS", "24"))
+DATA_API_LIMIT = int(os.environ.get("DATA_API_LIMIT", "50"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+SEEN_TRADES_TTL_SECONDS = int(os.environ.get("SEEN_TRADES_TTL_SECONDS", "86400"))
+SEEN_TRADES_MAX = int(os.environ.get("SEEN_TRADES_MAX", "50000"))
 
 # ============== AUTO-WITHDRAWAL CONFIG ==============
 # Set these via environment variables for security
@@ -186,11 +196,13 @@ WORST_TRADER_PNL = Gauge('poly_worst_trader_pnl_usd', 'Worst trader PnL', ['wall
 VOLUME_PATH = Path("/app/data")
 if VOLUME_PATH.exists():
     LOG_FILE = VOLUME_PATH / "poly_trades.json"
+    DB_FILE = VOLUME_PATH / "poly_trades.db"
     WITHDRAWAL_LOG_FILE = VOLUME_PATH / "withdrawals.json"
     MISSED_TRADES_FILE = VOLUME_PATH / "missed_trades.json"
     STATE_FILE = VOLUME_PATH / "tracker_state.json"
 else:
     LOG_FILE = Path(__file__).parent / "logs" / "poly_trades.json"
+    DB_FILE = Path(__file__).parent / "logs" / "poly_trades.db"
     WITHDRAWAL_LOG_FILE = Path(__file__).parent / "logs" / "withdrawals.json"
     MISSED_TRADES_FILE = Path(__file__).parent / "logs" / "missed_trades.json"
     STATE_FILE = Path(__file__).parent / "logs" / "tracker_state.json"
@@ -219,6 +231,360 @@ class AutoWithdrawal:
             self._load_history()
         else:
             print("Auto-withdrawal DISABLED - set COLD_WALLET_ADDRESS and HOT_WALLET_PRIVATE_KEY env vars")
+
+
+class TradeStore:
+    """Postgres-backed trade storage (fallback to SQLite if DATABASE_URL is unset)."""
+
+    def __init__(self, db_path: Path, postgres_url: str = ""):
+        self.db_path = db_path
+        self.postgres_url = postgres_url
+        self.use_postgres = bool(self.postgres_url)
+        self.conn = None
+        self._connect()
+        self._init_schema()
+
+    def _connect(self):
+        if self.use_postgres:
+            try:
+                import psycopg2
+                from psycopg2.extras import Json
+            except Exception as e:
+                raise RuntimeError("psycopg2 is required for Postgres support") from e
+            self._psycopg2 = psycopg2
+            self._pg_json = Json
+            self.conn = psycopg2.connect(self.postgres_url, connect_timeout=5)
+            self.conn.autocommit = True
+        else:
+            self.db_path.parent.mkdir(exist_ok=True)
+            self.conn = sqlite3.connect(self.db_path)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+
+    def _pg_run(self, func):
+        try:
+            return func()
+        except (self._psycopg2.OperationalError, self._psycopg2.InterfaceError):
+            self._connect()
+            return func()
+
+    def _init_schema(self):
+        if self.use_postgres:
+            def _init():
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS trades (
+                            id BIGSERIAL PRIMARY KEY,
+                            timestamp TEXT,
+                            token_id TEXT,
+                            side TEXT,
+                            trader TEXT,
+                            data JSONB NOT NULL
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        DELETE FROM trades a
+                        USING trades b
+                        WHERE a.id > b.id
+                          AND a.timestamp IS NOT DISTINCT FROM b.timestamp
+                          AND a.token_id IS NOT DISTINCT FROM b.token_id
+                          AND a.side IS NOT DISTINCT FROM b.side
+                          AND a.trader IS NOT DISTINCT FROM b.trader
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS missed_trades (
+                            id BIGSERIAL PRIMARY KEY,
+                            timestamp TEXT,
+                            token_id TEXT,
+                            trader TEXT,
+                            reason TEXT,
+                            data JSONB NOT NULL
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        DELETE FROM missed_trades a
+                        USING missed_trades b
+                        WHERE a.id > b.id
+                          AND a.timestamp IS NOT DISTINCT FROM b.timestamp
+                          AND a.token_id IS NOT DISTINCT FROM b.token_id
+                          AND a.trader IS NOT DISTINCT FROM b.trader
+                          AND a.reason IS NOT DISTINCT FROM b.reason
+                        """
+                    )
+                    cur.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_dedupe ON trades (timestamp, token_id, side, trader)"
+                    )
+                    cur.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_missed_dedupe ON missed_trades (timestamp, token_id, trader, reason)"
+                    )
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades (timestamp)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_token ON trades (token_id)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_missed_timestamp ON missed_trades (timestamp)")
+            self._pg_run(_init)
+        else:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    token_id TEXT,
+                    side TEXT,
+                    trader TEXT,
+                    data TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                DELETE FROM trades
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid)
+                    FROM trades
+                    GROUP BY timestamp, token_id, side, trader
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS missed_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    token_id TEXT,
+                    trader TEXT,
+                    reason TEXT,
+                    data TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                DELETE FROM missed_trades
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid)
+                    FROM missed_trades
+                    GROUP BY timestamp, token_id, trader, reason
+                )
+                """
+            )
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_dedupe ON trades (timestamp, token_id, side, trader)"
+            )
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_missed_dedupe ON missed_trades (timestamp, token_id, trader, reason)"
+            )
+            self.conn.commit()
+
+    def has_trades(self) -> bool:
+        if self.use_postgres:
+            def _run():
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM trades LIMIT 1")
+                    return cur.fetchone() is not None
+            return bool(self._pg_run(_run))
+        cur = self.conn.execute("SELECT 1 FROM trades LIMIT 1")
+        return cur.fetchone() is not None
+
+    def has_missed(self) -> bool:
+        if self.use_postgres:
+            def _run():
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM missed_trades LIMIT 1")
+                    return cur.fetchone() is not None
+            return bool(self._pg_run(_run))
+        cur = self.conn.execute("SELECT 1 FROM missed_trades LIMIT 1")
+        return cur.fetchone() is not None
+
+    def load_trades(self) -> list:
+        trades = []
+        if self.use_postgres:
+            def _run():
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT data FROM trades ORDER BY id ASC")
+                    return cur.fetchall()
+            rows = self._pg_run(_run)
+            for row in rows:
+                payload = row[0]
+                trades.append(payload if isinstance(payload, (dict, list)) else json.loads(payload))
+            return trades
+        for row in self.conn.execute("SELECT data FROM trades ORDER BY id ASC"):
+            trades.append(json.loads(row[0]))
+        return trades
+
+    def load_missed_trades(self) -> list:
+        trades = []
+        if self.use_postgres:
+            def _run():
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT data FROM missed_trades ORDER BY id ASC")
+                    return cur.fetchall()
+            rows = self._pg_run(_run)
+            for row in rows:
+                payload = row[0]
+                trades.append(payload if isinstance(payload, (dict, list)) else json.loads(payload))
+            return trades
+        for row in self.conn.execute("SELECT data FROM missed_trades ORDER BY id ASC"):
+            trades.append(json.loads(row[0]))
+        return trades
+
+    def insert_trade(self, trade: dict):
+        if self.use_postgres:
+            data_payload = self._pg_json(trade)
+            def _run():
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO trades (timestamp, token_id, side, trader, data) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                        (
+                            trade.get("timestamp"),
+                            trade.get("token_id"),
+                            trade.get("side"),
+                            trade.get("trader"),
+                            data_payload,
+                        ),
+                    )
+            self._pg_run(_run)
+            return
+        self.conn.execute(
+            "INSERT OR IGNORE INTO trades (timestamp, token_id, side, trader, data) VALUES (?, ?, ?, ?, ?)",
+            (
+                trade.get("timestamp"),
+                trade.get("token_id"),
+                trade.get("side"),
+                trade.get("trader"),
+                json.dumps(trade, separators=(",", ":")),
+            ),
+        )
+        self.conn.commit()
+
+    def insert_missed_trade(self, trade: dict):
+        if self.use_postgres:
+            data_payload = self._pg_json(trade)
+            def _run():
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO missed_trades (timestamp, token_id, trader, reason, data) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                        (
+                            trade.get("timestamp"),
+                            trade.get("token_id"),
+                            trade.get("trader"),
+                            trade.get("reason"),
+                            data_payload,
+                        ),
+                    )
+            self._pg_run(_run)
+            return
+        self.conn.execute(
+            "INSERT OR IGNORE INTO missed_trades (timestamp, token_id, trader, reason, data) VALUES (?, ?, ?, ?, ?)",
+            (
+                trade.get("timestamp"),
+                trade.get("token_id"),
+                trade.get("trader"),
+                trade.get("reason"),
+                json.dumps(trade, separators=(",", ":")),
+            ),
+        )
+        self.conn.commit()
+
+    def bulk_insert_trades(self, trades: list):
+        if self.use_postgres:
+            rows = []
+            for trade in trades:
+                data_payload = self._pg_json(trade)
+                rows.append(
+                    (
+                        trade.get("timestamp"),
+                        trade.get("token_id"),
+                        trade.get("side"),
+                        trade.get("trader"),
+                        data_payload,
+                    )
+                )
+            def _run():
+                prev_autocommit = self.conn.autocommit
+                self.conn.autocommit = False
+                try:
+                    with self.conn.cursor() as cur:
+                        cur.executemany(
+                            "INSERT INTO trades (timestamp, token_id, side, trader, data) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            rows,
+                        )
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
+                finally:
+                    self.conn.autocommit = prev_autocommit
+            self._pg_run(_run)
+            return
+        rows = []
+        for trade in trades:
+            rows.append(
+                (
+                    trade.get("timestamp"),
+                    trade.get("token_id"),
+                    trade.get("side"),
+                    trade.get("trader"),
+                    json.dumps(trade, separators=(",", ":")),
+                )
+            )
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO trades (timestamp, token_id, side, trader, data) VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        self.conn.commit()
+
+    def bulk_insert_missed_trades(self, trades: list):
+        if self.use_postgres:
+            rows = []
+            for trade in trades:
+                data_payload = self._pg_json(trade)
+                rows.append(
+                    (
+                        trade.get("timestamp"),
+                        trade.get("token_id"),
+                        trade.get("trader"),
+                        trade.get("reason"),
+                        data_payload,
+                    )
+                )
+            def _run():
+                prev_autocommit = self.conn.autocommit
+                self.conn.autocommit = False
+                try:
+                    with self.conn.cursor() as cur:
+                        cur.executemany(
+                            "INSERT INTO missed_trades (timestamp, token_id, trader, reason, data) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                            rows,
+                        )
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
+                finally:
+                    self.conn.autocommit = prev_autocommit
+            self._pg_run(_run)
+            return
+        rows = []
+        for trade in trades:
+            rows.append(
+                (
+                    trade.get("timestamp"),
+                    trade.get("token_id"),
+                    trade.get("trader"),
+                    trade.get("reason"),
+                    json.dumps(trade, separators=(",", ":")),
+                )
+            )
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO missed_trades (timestamp, token_id, trader, reason, data) VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        self.conn.commit()
 
     def _setup_web3(self):
         """Initialize Web3 connection and contracts."""
@@ -454,6 +820,8 @@ class Portfolio:
         self.daily_reset_date = datetime.now().date()  # Track when we last reset daily metrics
         self.paused_since = None  # Timestamp when trading was paused (for health monitoring)
         self.last_health_alert = None  # Prevent alert spam
+        self.last_seen_trades = {addr: 0 for addr in TRACKED_WALLETS}  # wallet_addr -> last timestamp
+        self.last_block = 0  # last processed on-chain block
 
         # Per-wallet stats: wallet_name -> {trades, open, closed, pnl, volume, wins, losses}
         self.wallet_stats = {name: {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
@@ -481,6 +849,13 @@ class Portfolio:
         self.position_prices = {}  # token_id -> current_price
         self.position_price_times = {}  # token_id -> timestamp of last successful price fetch
         self.last_price_update = 0
+
+        # Persistent trade storage (Postgres/SQLite)
+        self.store = None
+        try:
+            self.store = TradeStore(DB_FILE, DATABASE_URL)
+        except Exception as e:
+            print(f"⚠ Failed to initialize trade DB: {e}")
 
         # Error tracking for monitoring
         self.error_counts = {
@@ -535,94 +910,117 @@ class Portfolio:
         print(f"Looking for log file at: {LOG_FILE}")
         print(f"Log file exists: {LOG_FILE.exists()}")
 
-        # Seed volume with bundled log if volume is empty
-        if VOLUME_PATH.exists() and not LOG_FILE.exists():
-            bundled_log = Path(__file__).parent / "logs" / "poly_trades.json"
-            if bundled_log.exists():
-                print(f"Seeding volume from bundled log: {bundled_log}")
-                import shutil
-                shutil.copy(bundled_log, LOG_FILE)
+        trades_source = []
+        if self.store and self.store.has_trades():
+            try:
+                print("Restoring state from trade DB...")
+                trades_source = self.store.load_trades()
+            except Exception as e:
+                print(f"   ⚠ Failed to load trades from DB: {e}")
+                trades_source = []
 
-        if not LOG_FILE.exists():
-            return
+        if not trades_source:
+            # Seed volume with bundled log if volume is empty
+            if VOLUME_PATH.exists() and not LOG_FILE.exists():
+                bundled_log = Path(__file__).parent / "logs" / "poly_trades.json"
+                if bundled_log.exists():
+                    print(f"Seeding volume from bundled log: {bundled_log}")
+                    import shutil
+                    shutil.copy(bundled_log, LOG_FILE)
 
-        print("Restoring state from trade log...")
+            if not LOG_FILE.exists():
+                return
+
+            print("Restoring state from trade log...")
+            try:
+                with open(LOG_FILE, "r") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        trades_source.append(json.loads(line))
+            except Exception as e:
+                print(f"   ⚠ Failed to read trade log: {e}")
+                return
+
+            # Backfill DB for reliability
+            if self.store and trades_source:
+                try:
+                    self.store.bulk_insert_trades(trades_source)
+                except Exception as e:
+                    print(f"   ⚠ Failed to backfill trade DB: {e}")
+
         try:
-            with open(LOG_FILE, "r") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    trade = json.loads(line)
-                    self.trades.append(trade)
-                    self.daily_volume += trade.get("copy_size", 0)
+            for trade in trades_source:
+                self.trades.append(trade)
+                self.daily_volume += trade.get("copy_size", 0)
 
-                    # Rebuild positions
-                    token_id = trade.get("token_id", "unknown")
-                    side = trade["side"]
-                    copy_size = trade.get("copy_size", 10)
-                    price = trade.get("price", 0.5)
-                    market = trade.get("market", "Unknown")
-                    wallet_name = trade.get("trader", next(iter(TRACKED_WALLETS.values()), "unknown"))
+                # Rebuild positions
+                token_id = trade.get("token_id", "unknown")
+                side = trade["side"]
+                copy_size = trade.get("copy_size", 10)
+                price = trade.get("price", 0.5)
+                market = trade.get("market", "Unknown")
+                wallet_name = trade.get("trader", next(iter(TRACKED_WALLETS.values()), "unknown"))
 
-                    # Ensure wallet exists in stats
-                    if wallet_name not in self.wallet_stats:
-                        self.wallet_stats[wallet_name] = {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
+                # Ensure wallet exists in stats
+                if wallet_name not in self.wallet_stats:
+                    self.wallet_stats[wallet_name] = {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
 
-                    # Update wallet stats
-                    self.wallet_stats[wallet_name]["trades"] += 1
-                    self.wallet_stats[wallet_name]["volume"] += copy_size
+                # Update wallet stats
+                self.wallet_stats[wallet_name]["trades"] += 1
+                self.wallet_stats[wallet_name]["volume"] += copy_size
 
-                    if side == "BUY":
-                        if token_id not in self.positions:
-                            self.positions[token_id] = {"size": 0, "cost": 0, "market": market, "entry_price": price}
-                            self.position_wallet[token_id] = wallet_name
+                if side == "BUY":
+                    if token_id not in self.positions:
+                        self.positions[token_id] = {"size": 0, "cost": 0, "market": market, "entry_price": price}
+                        self.position_wallet[token_id] = wallet_name
+                    pos = self.positions[token_id]
+                    pos["cost"] += copy_size
+                    pos["size"] += copy_size / price if price > 0 else 0
+                    pos["entry_price"] = pos["cost"] / pos["size"] if pos["size"] > 0 else price
+                else:
+                    # Count all SELLs as closes
+                    # Use stored trade_pnl if available, otherwise calculate
+                    pnl = trade.get("trade_pnl", 0)
+
+                    if token_id in self.positions:
                         pos = self.positions[token_id]
-                        pos["cost"] += copy_size
-                        pos["size"] += copy_size / price if price > 0 else 0
-                        pos["entry_price"] = pos["cost"] / pos["size"] if pos["size"] > 0 else price
-                    else:
-                        # Count all SELLs as closes
-                        # Use stored trade_pnl if available, otherwise calculate
-                        pnl = trade.get("trade_pnl", 0)
 
-                        if token_id in self.positions:
-                            pos = self.positions[token_id]
-
-                            # If no trade_pnl stored, calculate it (legacy trades)
-                            if pnl == 0 and pos["entry_price"] > 0:
-                                entry_cost = trade.get("entry_cost", pos["cost"])
-                                shares_sold = entry_cost / pos["entry_price"] if pos["entry_price"] > 0 else 0
-                                pnl = (price - pos["entry_price"]) * shares_sold
-
-                            self.realised_pnl += pnl
-
-                            # Track PnL and wins/losses per wallet
-                            pos_wallet = self.position_wallet.get(token_id, wallet_name)
-                            if pos_wallet in self.wallet_stats:
-                                self.wallet_stats[pos_wallet]["pnl"] += pnl
-                                self.wallet_stats[pos_wallet]["closed"] += 1
-                                if pnl >= 0:
-                                    self.wallet_stats[pos_wallet]["wins"] += 1
-                                else:
-                                    self.wallet_stats[pos_wallet]["losses"] += 1
-
-                            # Update position tracking
+                        # If no trade_pnl stored, calculate it (legacy trades)
+                        if pnl == 0 and pos["entry_price"] > 0:
                             entry_cost = trade.get("entry_cost", pos["cost"])
                             shares_sold = entry_cost / pos["entry_price"] if pos["entry_price"] > 0 else 0
-                            pos["size"] -= shares_sold
-                            pos["cost"] -= entry_cost
-                            if pos["size"] <= 0.01 or pos["cost"] <= 0.01:
-                                del self.positions[token_id]
-                                if token_id in self.position_wallet:
-                                    del self.position_wallet[token_id]
-                        else:
-                            # Orphan SELL - use trade_pnl if available
-                            self.realised_pnl += pnl
-                            self.wallet_stats[wallet_name]["closed"] += 1
+                            pnl = (price - pos["entry_price"]) * shares_sold
+
+                        self.realised_pnl += pnl
+
+                        # Track PnL and wins/losses per wallet
+                        pos_wallet = self.position_wallet.get(token_id, wallet_name)
+                        if pos_wallet in self.wallet_stats:
+                            self.wallet_stats[pos_wallet]["pnl"] += pnl
+                            self.wallet_stats[pos_wallet]["closed"] += 1
                             if pnl >= 0:
-                                self.wallet_stats[wallet_name]["wins"] += 1
+                                self.wallet_stats[pos_wallet]["wins"] += 1
                             else:
-                                self.wallet_stats[wallet_name]["losses"] += 1
+                                self.wallet_stats[pos_wallet]["losses"] += 1
+
+                        # Update position tracking
+                        entry_cost = trade.get("entry_cost", pos["cost"])
+                        shares_sold = entry_cost / pos["entry_price"] if pos["entry_price"] > 0 else 0
+                        pos["size"] -= shares_sold
+                        pos["cost"] -= entry_cost
+                        if pos["size"] <= 0.01 or pos["cost"] <= 0.01:
+                            del self.positions[token_id]
+                            if token_id in self.position_wallet:
+                                del self.position_wallet[token_id]
+                    else:
+                        # Orphan SELL - use trade_pnl if available
+                        self.realised_pnl += pnl
+                        self.wallet_stats[wallet_name]["closed"] += 1
+                        if pnl >= 0:
+                            self.wallet_stats[wallet_name]["wins"] += 1
+                        else:
+                            self.wallet_stats[wallet_name]["losses"] += 1
 
             # Calculate open positions per wallet
             for token_id, wallet_name in self.position_wallet.items():
@@ -671,7 +1069,14 @@ class Portfolio:
             print(f"   ⚠ Failed to restore state: {e}")
 
         # Restore missed trades
-        if MISSED_TRADES_FILE.exists():
+        if self.store and self.store.has_missed():
+            try:
+                self.missed_trades = self.store.load_missed_trades()
+                self.missed_trades_total = len(self.missed_trades)
+                print(f"   📊 Restored {len(self.missed_trades)} missed trades (total {self.missed_trades_total})")
+            except Exception as e:
+                print(f"   ⚠ Failed to restore missed trades from DB: {e}")
+        elif MISSED_TRADES_FILE.exists():
             try:
                 with open(MISSED_TRADES_FILE, "r") as f:
                     for line in f:
@@ -679,6 +1084,11 @@ class Portfolio:
                             self.missed_trades.append(json.loads(line))
                 self.missed_trades_total = len(self.missed_trades)
                 print(f"   📊 Restored {len(self.missed_trades)} missed trades (total {self.missed_trades_total})")
+                if self.store and self.missed_trades:
+                    try:
+                        self.store.bulk_insert_missed_trades(self.missed_trades)
+                    except Exception as e:
+                        print(f"   ⚠ Failed to backfill missed trades DB: {e}")
             except Exception as e:
                 print(f"   ⚠ Failed to restore missed trades: {e}")
 
@@ -733,6 +1143,8 @@ class Portfolio:
                 "daily_start_value": self.daily_start_value,
                 "daily_reset_date": self.daily_reset_date.isoformat(),
                 "paused_since": self.paused_since.isoformat() if self.paused_since else None,
+                "last_seen_trades": self.last_seen_trades,
+                "last_block": self.last_block,
                 "last_updated": datetime.now().isoformat()
             }
             with open(STATE_FILE, "w") as f:
@@ -760,6 +1172,20 @@ class Portfolio:
 
             saved_date = datetime.fromisoformat(state.get("daily_reset_date", "2000-01-01")).date()
             today = datetime.now().date()
+
+            # Restore last seen trade timestamps and last block regardless of day
+            try:
+                saved_last_seen = state.get("last_seen_trades", {})
+                if isinstance(saved_last_seen, dict):
+                    self.last_seen_trades = {
+                        addr: int(saved_last_seen.get(addr, 0) or 0)
+                        for addr in TRACKED_WALLETS
+                    }
+                else:
+                    self.last_seen_trades = {addr: 0 for addr in TRACKED_WALLETS}
+                self.last_block = int(state.get("last_block", 0) or 0)
+            except Exception as e:
+                print(f"   ⚠ Failed to restore last seen state: {e}")
 
             # Only restore if same day, otherwise start fresh
             if saved_date == today:
@@ -790,21 +1216,9 @@ class Portfolio:
                 return int(datetime.now().timestamp())
         return int(datetime(date_obj.year, date_obj.month, date_obj.day).timestamp())
 
-    def copy_trade(self, trade_data: dict) -> bool:
+    def copy_trade(self, trade_data: dict, is_backfill: bool = False) -> bool:
         """Copy a real trade from a tracked wallet."""
         start = time.time()
-
-        # Check kill switch
-        if check_kill_switch():
-            print("🛑 KILL SWITCH ACTIVE - Trade blocked")
-            MISSED_TRADES.labels(reason="kill_switch").inc()
-            return False
-
-        # Check if trading is paused due to daily loss
-        if self.trading_paused:
-            print("⏸️ Trading paused - daily loss limit reached")
-            MISSED_TRADES.labels(reason="daily_loss_limit").inc()
-            return False
 
         side = trade_data["side"]
         original_size = trade_data["size"]
@@ -814,16 +1228,19 @@ class Portfolio:
         wallet_name = trade_data.get("trader", "unknown")
         slug = trade_data.get("slug")
         category = trade_data.get("category", "Other")
-
-        # Validate price - never use fake/invalid prices
-        if price is None or price <= 0 or price > 1:
-            print(f"⚠ Rejecting trade - invalid price: {price}")
-            MISSED_TRADES.labels(reason="invalid_price").inc()
-            return False
+        outcome = trade_data.get("outcome")
 
         # Ensure wallet exists in stats
         if wallet_name not in self.wallet_stats:
             self.wallet_stats[wallet_name] = {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
+
+        # Validate size before sizing
+        if original_size <= 0:
+            print(f"⚠ Rejecting trade - invalid size: {original_size}")
+            MISSED_TRADES.labels(reason="invalid_size").inc()
+            if not is_backfill:
+                self._record_missed_trade(trade_data, "invalid_size", intended_size=0)
+            return False
 
         # Calculate copy size with smart sizing based on trader win rate
         base_ratio = COPY_RATIO
@@ -857,9 +1274,32 @@ class Portfolio:
 
         copy_size = original_size * base_ratio
         copy_size = max(MIN_COPY_SIZE, min(MAX_COPY_SIZE, copy_size))
+        intended_copy_size = copy_size
+
+        # Check kill switch
+        if not is_backfill and check_kill_switch():
+            print("🛑 KILL SWITCH ACTIVE - Trade blocked")
+            MISSED_TRADES.labels(reason="kill_switch").inc()
+            self._record_missed_trade(trade_data, "kill_switch", intended_copy_size)
+            return False
+
+        # Check if trading is paused due to daily loss
+        if not is_backfill and self.trading_paused:
+            print("⏸️ Trading paused - daily loss limit reached")
+            MISSED_TRADES.labels(reason="daily_loss_limit").inc()
+            self._record_missed_trade(trade_data, "daily_loss_limit", intended_copy_size)
+            return False
+
+        # Validate price - never use fake/invalid prices
+        if price is None or price <= 0 or price > 1:
+            print(f"⚠ Rejecting trade - invalid price: {price}")
+            MISSED_TRADES.labels(reason="invalid_price").inc()
+            if not is_backfill:
+                self._record_missed_trade(trade_data, "invalid_price", intended_copy_size)
+            return False
 
         # Check portfolio exposure limit for BUYs
-        if side == "BUY":
+        if side == "BUY" and not is_backfill:
             current_exposure = sum(p["cost"] for p in self.positions.values())
             # Use current portfolio value, not fixed starting balance
             portfolio_value = self.balance + current_exposure
@@ -870,22 +1310,8 @@ class Portfolio:
                 if copy_size < MIN_COPY_SIZE:
                     print(f"  ❌ Cannot open position - max exposure reached")
                     MISSED_TRADES.labels(reason="max_exposure").inc()
-                    # Log missed trade for analysis
-                    missed_trade = {
-                        "timestamp": datetime.now().isoformat(),
-                        "trader": wallet_name,
-                        "side": side,
-                        "market": market,
-                        "token_id": token_id,
-                        "price": price,
-                        "intended_size": original_size * base_ratio,
-                        "reason": "max_exposure",
-                        "slug": slug,
-                        "category": category
-                    }
-                    self.missed_trades.append(missed_trade)
-                    self._log_missed_trade(missed_trade)
-                    self.missed_trades_total += 1
+                    if not is_backfill:
+                        self._record_missed_trade(trade_data, "max_exposure", intended_copy_size)
                     return False
 
         fee = copy_size * 0.001
@@ -896,6 +1322,8 @@ class Portfolio:
             if cost > self.balance:
                 print(f"  Insufficient balance: need ${cost:.2f}, have ${self.balance:.2f}")
                 MISSED_TRADES.labels(reason="insufficient_balance").inc()
+                if not is_backfill:
+                    self._record_missed_trade(trade_data, "insufficient_balance", intended_copy_size)
                 return False
             self.balance -= cost
 
@@ -961,9 +1389,16 @@ class Portfolio:
         self.wallet_stats[wallet_name]["trades"] += 1
         self.wallet_stats[wallet_name]["volume"] += copy_size
 
-        outcome = trade_data.get("outcome")  # "Yes" or "No"
+        timestamp_override = trade_data.get("timestamp")
+        if isinstance(timestamp_override, (int, float)):
+            trade_timestamp = datetime.fromtimestamp(timestamp_override).isoformat()
+        elif isinstance(timestamp_override, str) and timestamp_override:
+            trade_timestamp = timestamp_override
+        else:
+            trade_timestamp = datetime.now().isoformat()
+
         trade_record = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": trade_timestamp,
             "side": side,
             "market": market,
             "category": category,
@@ -993,31 +1428,32 @@ class Portfolio:
         exposure = sum(p["cost"] for p in self.positions.values())
         portfolio_value = self.balance + exposure
 
-        # Check for daily reset (midnight rollover)
-        today = datetime.now().date()
-        if today != self.daily_reset_date:
-            print(f"🌅 Daily reset: new day {today}")
-            self.daily_start_value = portfolio_value  # Start fresh from current value
-            self.trading_paused = False  # Reset pause flag
-            self.paused_since = None
-            self.daily_reset_date = today
-            self.daily_volume = 0  # Reset daily volume too
-            self._save_state()
-
-        # Check daily loss limit
-        daily_pnl = portfolio_value - self.daily_start_value
-        if daily_pnl < -STARTING_BALANCE * DAILY_LOSS_LIMIT:
-            if not self.trading_paused:
-                self.trading_paused = True
-                self.paused_since = datetime.now()
+        if not is_backfill:
+            # Check for daily reset (midnight rollover)
+            today = datetime.now().date()
+            if today != self.daily_reset_date:
+                print(f"🌅 Daily reset: new day {today}")
+                self.daily_start_value = portfolio_value  # Start fresh from current value
+                self.trading_paused = False  # Reset pause flag
+                self.paused_since = None
+                self.daily_reset_date = today
+                self.daily_volume = 0  # Reset daily volume too
                 self._save_state()
-                print(f"🚨 DAILY LOSS LIMIT REACHED: ${daily_pnl:+,.2f}")
-        elif self.trading_paused and daily_pnl >= 0:
-            # Resume trading if we've recovered to break-even or better
-            self.trading_paused = False
-            self.paused_since = None
-            self._save_state()
-            print(f"✅ Trading resumed - daily P&L recovered: ${daily_pnl:+,.2f}")
+
+            # Check daily loss limit
+            daily_pnl = portfolio_value - self.daily_start_value
+            if daily_pnl < -STARTING_BALANCE * DAILY_LOSS_LIMIT:
+                if not self.trading_paused:
+                    self.trading_paused = True
+                    self.paused_since = datetime.now()
+                    self._save_state()
+                    print(f"🚨 DAILY LOSS LIMIT REACHED: ${daily_pnl:+,.2f}")
+            elif self.trading_paused and daily_pnl >= 0:
+                # Resume trading if we've recovered to break-even or better
+                self.trading_paused = False
+                self.paused_since = None
+                self._save_state()
+                print(f"✅ Trading resumed - daily P&L recovered: ${daily_pnl:+,.2f}")
 
         # Track latency (keep last 100)
         self.latencies.append(latency)
@@ -1032,7 +1468,14 @@ class Portfolio:
             self.category_stats[category]["pnl"] += trade_pnl
 
         # Daily P&L tracking
-        today = datetime.now().strftime("%Y-%m-%d")
+        if is_backfill:
+            try:
+                day_dt = datetime.fromisoformat(trade_timestamp.replace('Z', '+00:00'))
+            except Exception:
+                day_dt = datetime.now()
+            today = day_dt.strftime("%Y-%m-%d")
+        else:
+            today = datetime.now().strftime("%Y-%m-%d")
         if today not in self.daily_pnl:
             self.daily_pnl[today] = {
                 "pnl": 0.0,
@@ -1057,10 +1500,47 @@ class Portfolio:
     def _log_trade(self, trade: dict):
         with open(LOG_FILE, "a") as f:
             f.write(json.dumps(trade) + "\n")
+        if self.store:
+            try:
+                self.store.insert_trade(trade)
+            except Exception as e:
+                print(f"⚠ Failed to persist trade to DB: {e}")
 
     def _log_missed_trade(self, trade: dict):
         with open(MISSED_TRADES_FILE, "a") as f:
             f.write(json.dumps(trade) + "\n")
+        if self.store:
+            try:
+                self.store.insert_missed_trade(trade)
+            except Exception as e:
+                print(f"⚠ Failed to persist missed trade to DB: {e}")
+
+    def _record_missed_trade(self, trade_data: dict, reason: str, intended_size: float | None = None):
+        timestamp_override = trade_data.get("timestamp")
+        if isinstance(timestamp_override, (int, float)):
+            trade_timestamp = datetime.fromtimestamp(timestamp_override).isoformat()
+        elif isinstance(timestamp_override, str) and timestamp_override:
+            trade_timestamp = timestamp_override
+        else:
+            trade_timestamp = datetime.now().isoformat()
+
+        original_size = trade_data.get("size", 0)
+        missed_trade = {
+            "timestamp": trade_timestamp,
+            "trader": trade_data.get("trader", "unknown"),
+            "side": trade_data.get("side", "UNKNOWN"),
+            "market": trade_data.get("market", "Unknown"),
+            "token_id": trade_data.get("token_id", "unknown"),
+            "price": trade_data.get("price"),
+            "intended_size": intended_size if intended_size is not None else original_size,
+            "original_size": original_size,
+            "reason": reason,
+            "slug": trade_data.get("slug"),
+            "category": trade_data.get("category", "Other")
+        }
+        self.missed_trades.append(missed_trade)
+        self._log_missed_trade(missed_trade)
+        self.missed_trades_total += 1
 
     def _refresh_metrics(self):
         """Update all Prometheus metrics that depend on portfolio state."""
@@ -1260,7 +1740,7 @@ class Portfolio:
         runtime = datetime.now() - self.start_time
 
         print("\n" + "=" * 70)
-        print("@CIGARETTES COPY-TRADING RESULTS")
+        print("@MULTI-WALLET COPY-TRADING RESULTS")
         print("=" * 70)
         print(f"Runtime:           {runtime}")
         print(f"Starting Balance:  ${STARTING_BALANCE:,.2f}")
@@ -1282,8 +1762,8 @@ class MultiWalletTracker:
         self.auto_withdrawal = auto_withdrawal
         self.running = False
         self.session = None
-        self.seen_trades = set()
-        self.last_block = 0
+        self.seen_trades = OrderedDict()
+        self.last_block = portfolio.last_block or 0
         self.price_cache = {}  # Cache token prices
 
     async def start(self):
@@ -1297,8 +1777,131 @@ class MultiWalletTracker:
         if self.session:
             await self.session.close()
 
+    def _trade_key(self, wallet_name: str, token_id: str, side: str, size: float, timestamp: float | int) -> str:
+        return f"{wallet_name}:{token_id}:{side}:{size:.6f}:{int(timestamp)}"
+
+    def _seen_prune(self, now: float | None = None):
+        now = now or time.time()
+        while self.seen_trades:
+            _, ts = next(iter(self.seen_trades.items()))
+            if now - ts <= SEEN_TRADES_TTL_SECONDS and len(self.seen_trades) <= SEEN_TRADES_MAX:
+                break
+            self.seen_trades.popitem(last=False)
+
+    def _seen_contains(self, key: str, now: float | None = None) -> bool:
+        ts = self.seen_trades.get(key)
+        if ts is None:
+            return False
+        now = now or time.time()
+        if now - ts > SEEN_TRADES_TTL_SECONDS:
+            self.seen_trades.pop(key, None)
+            return False
+        return True
+
+    def _seen_add(self, key: str, ts: float | None = None):
+        now = ts or time.time()
+        self.seen_trades[key] = now
+        self.seen_trades.move_to_end(key)
+        self._seen_prune(now)
+
+    def _prime_seen_trades(self):
+        wallet_by_name = {name: addr for addr, name in TRACKED_WALLETS.items()}
+        for trade in self.portfolio.trades:
+            try:
+                ts = trade.get("timestamp", "")
+                if isinstance(ts, (int, float)):
+                    ts_epoch = int(ts)
+                else:
+                    ts_epoch = int(datetime.fromisoformat(str(ts).replace('Z', '+00:00')).timestamp())
+            except Exception:
+                ts_epoch = 0
+            size = float(trade.get("original_size", trade.get("copy_size", 0)) or 0)
+            key = self._trade_key(trade.get("trader", "unknown"), trade.get("token_id", ""), trade.get("side", ""), size, ts_epoch)
+            self._seen_add(key, ts_epoch if ts_epoch > 0 else None)
+            trader = trade.get("trader", "")
+            wallet_addr = wallet_by_name.get(trader)
+            if wallet_addr:
+                self.portfolio.last_seen_trades[wallet_addr] = max(self.portfolio.last_seen_trades.get(wallet_addr, 0), ts_epoch)
+
+    async def backfill_recent_trades(self):
+        if not BACKFILL_ENABLED:
+            print("🕒 Backfill disabled")
+            return
+        lookback_seconds = BACKFILL_LOOKBACK_HOURS * 3600
+        cutoff = time.time() - lookback_seconds
+
+        # Last seen timestamp per wallet from persistent state
+        last_seen = self.portfolio.last_seen_trades
+        for addr in TRACKED_WALLETS:
+            last_seen.setdefault(addr, 0)
+
+        for wallet_addr, wallet_name in TRACKED_WALLETS.items():
+            url = f"{POLYMARKET_DATA}/trades?user={wallet_addr}&limit=100"
+            try:
+                async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        print(f"⚠ Backfill failed for {wallet_name}: status {resp.status}")
+                        continue
+                    trades = await resp.json()
+            except Exception as e:
+                print(f"⚠ Backfill error for {wallet_name}: {e}")
+                continue
+
+            # Process trades oldest-first
+            for trade in reversed(trades):
+                ts = int(trade.get("timestamp", 0) or 0)
+                if ts <= 0:
+                    continue
+                if ts < cutoff or ts <= last_seen.get(wallet_addr, 0):
+                    continue
+                side = trade.get("side", "").upper()
+                size = float(trade.get("size", 0))
+                token_id = str(trade.get("asset", ""))
+                slug = trade.get("slug", "")
+                market_name = trade.get("title", f"Token {token_id[:20]}...")
+                raw_price = trade.get("price")
+                if raw_price is None or raw_price == 0:
+                    last_seen[wallet_addr] = max(last_seen.get(wallet_addr, 0), ts)
+                    continue
+                price = float(raw_price)
+                size_usd = size * price
+
+                key = self._trade_key(wallet_name, token_id, side, size_usd, ts)
+                if self._seen_contains(key):
+                    last_seen[wallet_addr] = max(last_seen.get(wallet_addr, 0), ts)
+                    continue
+                self._seen_add(key, ts)
+
+                category = detect_category(market_name, slug)
+                cached = self.price_cache.get(str(token_id), {})
+                outcome = cached.get("outcome")
+
+                trade_data = {
+                    "side": side,
+                    "size": size_usd,
+                    "price": price,
+                    "market": market_name,
+                    "token_id": token_id,
+                    "trader": wallet_name,
+                    "slug": slug,
+                    "category": category,
+                    "outcome": outcome,
+                    "timestamp": ts,
+                }
+
+                print(f"🕒 Backfill {side} @{wallet_name} {market_name[:40]}...")
+                self.portfolio.copy_trade(trade_data, is_backfill=True)
+                last_seen[wallet_addr] = max(last_seen.get(wallet_addr, 0), ts)
+
+        try:
+            self.portfolio._save_state()
+        except Exception:
+            pass
+
     async def run(self):
         await self.start()
+        self._prime_seen_trades()
+        await self.backfill_recent_trades()
 
         print(f"\nMonitoring {len(TRACKED_WALLETS)} wallets:")
         for addr, name in TRACKED_WALLETS.items():
@@ -1399,6 +2002,16 @@ class MultiWalletTracker:
 
                 if side in ["BUY", "SELL"] and size > 0:
                     size_usd = size * price if price < 10 else size  # Handle different formats
+                    timestamp_raw = data.get("timestamp") or data.get("time")
+                    if isinstance(timestamp_raw, (int, float)):
+                        timestamp = timestamp_raw
+                    elif isinstance(timestamp_raw, str) and timestamp_raw:
+                        try:
+                            timestamp = datetime.fromisoformat(timestamp_raw.replace('Z', '+00:00')).timestamp()
+                        except Exception:
+                            timestamp = time.time()
+                    else:
+                        timestamp = time.time()
 
                     print(f"\n⚡ [WS] {side} detected from @{wallet_name}")
 
@@ -1415,13 +2028,14 @@ class MultiWalletTracker:
                         "trader": wallet_name,
                         "slug": slug,
                         "category": category,
-                        "outcome": outcome
+                        "outcome": outcome,
+                        "timestamp": timestamp
                     }
 
                     # Deduplicate with seen_trades
-                    trade_key = f"{wallet_name}:{token_id}:{side}:{size_usd:.2f}"
-                    if trade_key not in self.seen_trades:
-                        self.seen_trades.add(trade_key)
+                    trade_key = self._trade_key(wallet_name, str(token_id), side, size_usd, timestamp)
+                    if not self._seen_contains(trade_key):
+                        self._seen_add(trade_key, timestamp)
                         success = self.portfolio.copy_trade(trade_data)
                         if success:
                             print(f"   ⚡ WS COPIED in <100ms")
@@ -1439,11 +2053,22 @@ class MultiWalletTracker:
                 "id": 1
             }) as resp:
                 data = await resp.json()
-                self.last_block = int(data["result"], 16)
-                print(f"📦 Starting from block {self.last_block}")
+                current_block = int(data["result"], 16)
+                if self.last_block > 0:
+                    # Rewind a few blocks to avoid missing reorgs
+                    self.last_block = max(self.last_block - 5, 0)
+                    if self.last_block > current_block:
+                        self.last_block = current_block
+                    print(f"📦 Resuming from block {self.last_block} (current {current_block})")
+                else:
+                    self.last_block = current_block
+                    print(f"📦 Starting from block {self.last_block}")
+                self.portfolio.last_block = self.last_block
         except Exception as e:
             print(f"⚠ Failed to get block number: {e}")
-            self.last_block = 67000000  # Fallback
+            if self.last_block <= 0:
+                self.last_block = 67000000  # Fallback
+            print(f"📦 Using fallback block {self.last_block}")
 
         while self.running:
             try:
@@ -1509,14 +2134,16 @@ class MultiWalletTracker:
                     await self.process_transfer(log, "SELL", wallet_name)
 
         self.last_block = current_block
+        self.portfolio.last_block = self.last_block
 
     async def process_transfer(self, log: dict, side: str, wallet_name: str = "unknown"):
         """Process an on-chain transfer event."""
         tx_hash = log.get("transactionHash", "")
+        event_ts = time.time()
 
-        if tx_hash in self.seen_trades:
+        if self._seen_contains(tx_hash, event_ts):
             return
-        self.seen_trades.add(tx_hash)
+        self._seen_add(tx_hash, event_ts)
 
         # Decode transfer data
         data = log.get("data", "0x")
@@ -1562,7 +2189,8 @@ class MultiWalletTracker:
             "slug": slug,
             "category": category,
             "outcome": outcome,
-            "option_name": option_name
+            "option_name": option_name,
+            "timestamp": event_ts
         }
 
         success = self.portfolio.copy_trade(trade_data)
@@ -1701,7 +2329,9 @@ class MultiWalletTracker:
         print("📡 Starting data API polling (every 10s)...", flush=True)
 
         # Track last seen trade timestamp per wallet
-        last_seen = {addr: 0 for addr in TRACKED_WALLETS}
+        last_seen = self.portfolio.last_seen_trades
+        for addr in TRACKED_WALLETS:
+            last_seen.setdefault(addr, 0)
         poll_count = 0
 
         api_backoff = 10
@@ -1711,13 +2341,15 @@ class MultiWalletTracker:
                 if poll_count % 30 == 1:  # Log every 5 minutes
                     print(f"📡 API poll #{poll_count} - checking {len(TRACKED_WALLETS)} wallets", flush=True)
                 for wallet_addr, wallet_name in TRACKED_WALLETS.items():
-                    url = f"{POLYMARKET_DATA}/trades?user={wallet_addr}&limit=10"
+                    url = f"{POLYMARKET_DATA}/trades?user={wallet_addr}&limit={DATA_API_LIMIT}"
                     async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         if resp.status == 200:
                             trades = await resp.json()
                             # Process trades oldest-first to maintain correct last_seen
                             for trade in reversed(trades):
-                                ts = trade.get("timestamp", 0)
+                                ts = int(trade.get("timestamp", 0) or 0)
+                                if ts <= 0:
+                                    continue
                                 if ts > last_seen[wallet_addr]:
                                     # New trade detected
                                     side = trade.get("side", "").upper()
@@ -1730,15 +2362,16 @@ class MultiWalletTracker:
                                     raw_price = trade.get("price")
                                     if raw_price is None or raw_price == 0:
                                         print(f"\n⚠ Skipping {side} from @{wallet_name} - no price in API response")
-                                        last_seen[wallet_addr] = ts
+                                        last_seen[wallet_addr] = max(last_seen.get(wallet_addr, 0), ts)
                                         continue
                                     price = float(raw_price)
+                                    size_usd = size * price
 
                                     if side in ["BUY", "SELL"] and size > 0:
                                         # Deduplicate
-                                        trade_key = f"{wallet_name}:{token_id}:{side}:{size:.2f}"
-                                        if trade_key not in self.seen_trades:
-                                            self.seen_trades.add(trade_key)
+                                        trade_key = self._trade_key(wallet_name, str(token_id), side, size_usd, ts)
+                                        if not self._seen_contains(trade_key):
+                                            self._seen_add(trade_key, ts)
 
                                             # Get category
                                             category = detect_category(market_name, slug)
@@ -1749,14 +2382,15 @@ class MultiWalletTracker:
 
                                             trade_data = {
                                                 "side": side,
-                                                "size": size * price,
+                                                "size": size_usd,
                                                 "price": price,
                                                 "market": market_name,
                                                 "token_id": str(token_id),
                                                 "trader": wallet_name,
                                                 "slug": slug,
                                                 "category": category,
-                                                "outcome": outcome
+                                                "outcome": outcome,
+                                                "timestamp": ts
                                             }
 
                                             print(f"\n📡 [API] {side} detected from @{wallet_name}", flush=True)
@@ -1767,7 +2401,7 @@ class MultiWalletTracker:
                                                 print(f"   📡 API COPIED", flush=True)
 
                                     # Update last_seen after processing each trade
-                                    last_seen[wallet_addr] = ts
+                                    last_seen[wallet_addr] = max(last_seen.get(wallet_addr, 0), ts)
                 api_backoff = 10
                 await asyncio.sleep(10)  # Poll every 10 seconds
             except Exception as e:
@@ -2591,6 +3225,9 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         for trade in portfolio.missed_trades:
             token_id = trade.get("token_id", "")
             entry_price = trade.get("price", 0)
+            intended_size = trade.get("intended_size")
+            if intended_size is None:
+                intended_size = trade.get("size", 0)
             # Try to get current price
             current_price = entry_price  # Default to entry if can't fetch
             try:
@@ -2604,7 +3241,6 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             except Exception as e:
                 print(f"⚠ Error fetching missed trade price: {e}")
 
-            intended_size = trade.get("intended_size", 0)
             potential_pnl = (current_price - entry_price) * (intended_size / entry_price) if entry_price > 0 else 0
 
             missed_with_current.append({
@@ -2614,7 +3250,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 "potential_pnl_pct": round((current_price - entry_price) / entry_price * 100, 2) if entry_price > 0 else 0
             })
 
-        total_missed_volume = sum(t.get("intended_size", 0) for t in portfolio.missed_trades)
+        total_missed_volume = sum((t.get("intended_size") if t.get("intended_size") is not None else t.get("size", 0)) for t in portfolio.missed_trades)
         total_potential_pnl = sum(t.get("potential_pnl", 0) for t in missed_with_current)
 
         return web.json_response({
