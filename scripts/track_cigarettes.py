@@ -2224,43 +2224,101 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         })
 
     async def recalculate_balance(request):
-        """Recalculate balance and realised P&L from trade log using trade_pnl values."""
+        """Completely rebuild portfolio state from trade log."""
         old_balance = portfolio.balance
         old_realised = portfolio.realised_pnl
 
-        # Calculate from trades
-        total_buy_cost = 0
-        total_sell_return = 0
-        total_pnl = 0
+        # Rebuild everything from scratch
+        positions = {}  # token_id -> {cost, size, entry_price}
+        balance = STARTING_BALANCE
+        realised_pnl = 0
+        wins = 0
+        losses = 0
 
         for trade in portfolio.trades:
+            token_id = trade.get("token_id", "")
+            side = trade["side"]
             copy_size = trade.get("copy_size", 0)
-            if trade["side"] == "BUY":
-                total_buy_cost += copy_size * 1.001  # with fee
-            else:
-                # For SELLs, use copy_size as return (should be actual_return now)
-                total_sell_return += copy_size * 0.999  # with fee
-                # Also sum trade_pnl for realised
-                total_pnl += trade.get("trade_pnl", 0)
+            price = trade.get("price", 0)
 
-        new_balance = STARTING_BALANCE - total_buy_cost + total_sell_return
-        portfolio.balance = new_balance
-        portfolio.realised_pnl = total_pnl
+            if side == "BUY":
+                cost = copy_size * 1.001  # with fee
+                balance -= cost
+                shares = copy_size / price if price > 0 else 0
+
+                if token_id not in positions:
+                    positions[token_id] = {"cost": 0, "size": 0, "entry_price": 0}
+                pos = positions[token_id]
+                pos["cost"] += copy_size
+                pos["size"] += shares
+                pos["entry_price"] = pos["cost"] / pos["size"] if pos["size"] > 0 else price
+
+            else:  # SELL
+                # Calculate actual return and P&L
+                if token_id in positions:
+                    pos = positions[token_id]
+                    entry_price = pos["entry_price"]
+                    # For resolved trades, use resolution price
+                    # For manual sells, use trade price
+                    exit_price = price if price > 0 else 0
+
+                    # How much are we selling?
+                    sell_cost = min(copy_size, pos["cost"]) if trade.get("resolution") else trade.get("entry_cost", pos["cost"])
+                    shares_sold = sell_cost / entry_price if entry_price > 0 else 0
+
+                    # Actual return = shares * exit_price
+                    actual_return = shares_sold * exit_price
+                    pnl = actual_return - sell_cost
+
+                    balance += actual_return * 0.999  # with fee
+                    realised_pnl += pnl
+
+                    if pnl >= 0:
+                        wins += 1
+                    else:
+                        losses += 1
+
+                    # Update position
+                    pos["size"] -= shares_sold
+                    pos["cost"] -= sell_cost
+                    if pos["size"] <= 0.01 or pos["cost"] <= 0.01:
+                        del positions[token_id]
+                else:
+                    # Orphan SELL - position not tracked, use trade_pnl if available
+                    pnl = trade.get("trade_pnl", 0)
+                    realised_pnl += pnl
+                    if pnl >= 0:
+                        wins += 1
+                    else:
+                        losses += 1
+
+        # Calculate open position value
+        open_cost = sum(p["cost"] for p in positions.values())
+
+        # Update portfolio state
+        portfolio.balance = balance
+        portfolio.realised_pnl = realised_pnl
+        portfolio.positions = {k: {"cost": v["cost"], "size": v["size"], "entry_price": v["entry_price"], "market": ""}
+                               for k, v in positions.items()}
 
         # Update metrics
-        BALANCE.set(new_balance)
-        REALISED_PNL.set(total_pnl)
+        BALANCE.set(balance)
+        REALISED_PNL.set(realised_pnl)
+        OPEN_POSITIONS.set(len(positions))
 
-        print(f"🔄 Recalculated: Balance ${old_balance:,.2f} → ${new_balance:,.2f}, Realised ${old_realised:,.2f} → ${total_pnl:,.2f}")
+        print(f"🔄 Rebuilt: Balance ${old_balance:,.2f} → ${balance:,.2f}, Realised ${old_realised:,.2f} → ${realised_pnl:,.2f}")
+        print(f"   Open positions: {len(positions)}, Wins: {wins}, Losses: {losses}")
 
         return web.json_response({
             "success": True,
             "old_balance": round(old_balance, 2),
-            "new_balance": round(new_balance, 2),
+            "new_balance": round(balance, 2),
             "old_realised_pnl": round(old_realised, 2),
-            "new_realised_pnl": round(total_pnl, 2),
-            "total_buy_cost": round(total_buy_cost, 2),
-            "total_sell_return": round(total_sell_return, 2)
+            "new_realised_pnl": round(realised_pnl, 2),
+            "open_positions": len(positions),
+            "open_cost": round(open_cost, 2),
+            "wins": wins,
+            "losses": losses
         })
 
     async def get_missed_trades(request):
