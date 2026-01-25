@@ -2217,7 +2217,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             pnl_pct = pnl_pct if pnl_pct is not None else 0.0
 
             # Calculate price age in minutes (only for open positions with live prices)
-            price_age_min = None
+            price_age_min = 0
             if status == "OPEN" and token_id in portfolio.position_price_times:
                 price_age_sec = time.time() - portfolio.position_price_times[token_id]
                 price_age_min = round(price_age_sec / 60, 1)
@@ -2232,12 +2232,12 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 "option": option_name,  # e.g., "SRZP" for multi-outcome markets
                 "market": market_name,
                 "slug": slug,
-                "entry": round(entry_price, 4) if entry_price else None,
-                "current": round(current_price, 4) if current_price else None,
+                "entry": round(entry_price, 4) if entry_price else 0,
+                "current": round(current_price, 4) if current_price else 0,
                 "size": round(copy_size, 2),
-                "pnl": round(pnl, 2) if pnl is not None else None,
-                "pnl_pct": round(pnl_pct, 1) if pnl_pct is not None else None,
-                "price_age_min": price_age_min  # Minutes since last price update (None if no live price)
+                "pnl": round(pnl, 2) if pnl is not None else 0,
+                "pnl_pct": round(pnl_pct, 1) if pnl_pct is not None else 0,
+                "price_age_min": price_age_min
             })
         return web.json_response(all_trades)
 
@@ -2398,7 +2398,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "best_trader": best_trader,
             "worst_trader": worst_trader,
             "prices_updated": portfolio.last_price_update > 0,
-            "prices_age_sec": round(time.time() - portfolio.last_price_update) if portfolio.last_price_update > 0 else None
+            "prices_age_sec": round(time.time() - portfolio.last_price_update) if portfolio.last_price_update > 0 else 0
         })
 
     async def get_categories(request):
@@ -2989,7 +2989,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 "token_id": token_id[:20] + "...",
                 "market": market,
                 "entry_price": round(entry_price, 4),
-                "current_price": round(current_price, 4) if current_price else None,
+                "current_price": round(current_price, 4) if current_price else 0,
                 "shares": round(shares, 2),
                 "cost": round(cost, 2),
                 "current_value": round(current_value, 2),
@@ -3000,9 +3000,9 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         prices = list(portfolio.position_prices.values())
         price_stats = {
             "count": len(prices),
-            "min": round(min(prices), 4) if prices else None,
-            "max": round(max(prices), 4) if prices else None,
-            "avg": round(sum(prices) / len(prices), 4) if prices else None,
+            "min": round(min(prices), 4) if prices else 0,
+            "max": round(max(prices), 4) if prices else 0,
+            "avg": round(sum(prices) / len(prices), 4) if prices else 0,
             "outside_0_1": len([p for p in prices if p < 0 or p > 1])
         }
 
@@ -3101,7 +3101,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 "state_writable": STATE_FILE.parent.exists(),
                 "kill_switch": check_kill_switch(),
                 "trading_paused": portfolio.trading_paused,
-                "paused_duration_sec": round(paused_duration) if paused_duration else None,
+                "paused_duration_sec": round(paused_duration) if paused_duration else 0,
                 "paused_but_profitable": paused_but_profitable
             }
         })
