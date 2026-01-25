@@ -3698,6 +3698,26 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "remaining": len(portfolio.trades)
         })
 
+    async def assign_unknown_to_cigarettes(request):
+        """Assign all trades with unknown/missing trader to cigarettes."""
+        updated = 0
+        for trade in portfolio.trades:
+            trader = trade.get("trader") or trade.get("wallet")
+            if not trader or trader == "unknown":
+                trade["trader"] = "cigarettes"
+                trade["wallet"] = "cigarettes"
+                updated += 1
+
+        if updated > 0:
+            with open(LOG_FILE, 'w') as f:
+                for t in portfolio.trades:
+                    f.write(json.dumps(t) + "\n")
+
+        return web.json_response({
+            "status": "success",
+            "updated": updated
+        })
+
     async def resolve_ended_markets(request):
         """Check for resolved markets and close positions with final P&L."""
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -4053,6 +4073,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_post("/backfill-outcomes", backfill_outcomes)
     app.router.add_post("/backfill-wallets", backfill_wallets)
     app.router.add_post("/purge-unknown", purge_unknown_trades)
+    app.router.add_post("/assign-cigarettes", assign_unknown_to_cigarettes)
     app.router.add_post("/resolve", resolve_ended_markets)
     app.router.add_get("/reconcile", reconcile_positions)
     app.router.add_post("/update-prices", trigger_price_update)
