@@ -3808,6 +3808,115 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "remaining": len(portfolio.trades)
         })
 
+    async def backfill_markets(request):
+        """Backfill missing market names by looking up token_ids in Polymarket API."""
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        updated = 0
+        failed = 0
+        already_ok = 0
+
+        # Find trades needing market info
+        def needs_market(trade):
+            market = trade.get("market", "")
+            if not market:
+                return True
+            if market == "Unknown":
+                return True
+            if market.startswith("Token "):
+                return True
+            return False
+
+        # Collect unique token_ids that need lookup
+        tokens_to_lookup = set()
+        for trade in portfolio.trades:
+            if needs_market(trade):
+                token_id = trade.get("token_id")
+                if token_id:
+                    tokens_to_lookup.add(token_id)
+            else:
+                already_ok += 1
+
+        if not tokens_to_lookup:
+            return web.json_response({
+                "status": "success",
+                "message": "All trades have market names",
+                "already_ok": already_ok
+            })
+
+        print(f"🔍 Backfilling market info for {len(tokens_to_lookup)} tokens...")
+
+        async with aiohttp.ClientSession() as session:
+            for token_id in tokens_to_lookup:
+                try:
+                    # Query Gamma API for market info
+                    url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={token_id}"
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data and len(data) > 0:
+                                market_data = data[0]
+                                market_name = market_data.get("question", "")
+                                slug = market_data.get("slug", "")
+                                category = detect_category(market_name, slug)
+                                option_name = market_data.get("groupItemTitle", "")
+
+                                # Get outcome from token position in clob_tokens
+                                outcome = None
+                                clob_tokens_raw = market_data.get("clobTokenIds", "[]")
+                                outcomes_raw = market_data.get("outcomes", "[]")
+                                clob_tokens = json.loads(clob_tokens_raw) if isinstance(clob_tokens_raw, str) else clob_tokens_raw
+                                outcomes_list = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                                if token_id in clob_tokens:
+                                    idx = clob_tokens.index(token_id)
+                                    if idx < len(outcomes_list):
+                                        outcome = outcomes_list[idx]
+
+                                # Update all trades with this token_id
+                                for trade in portfolio.trades:
+                                    if trade.get("token_id") == token_id:
+                                        if market_name:
+                                            trade["market"] = market_name
+                                        if slug:
+                                            trade["slug"] = slug
+                                        if category:
+                                            trade["category"] = category
+                                        if outcome:
+                                            trade["outcome"] = outcome
+                                        if option_name:
+                                            trade["option_name"] = option_name
+                                        updated += 1
+
+                                # Also update position if exists
+                                if token_id in portfolio.positions:
+                                    if market_name:
+                                        portfolio.positions[token_id]["market"] = market_name
+                                    if slug:
+                                        portfolio.positions[token_id]["slug"] = slug
+                                    if category:
+                                        portfolio.positions[token_id]["category"] = category
+                                    if outcome:
+                                        portfolio.positions[token_id]["outcome"] = outcome
+                except Exception as e:
+                    print(f"⚠ Error fetching market for {token_id[:20]}: {e}")
+                    failed += 1
+
+                await asyncio.sleep(0.1)  # Rate limit
+
+        # Save updated trades
+        with open(LOG_FILE, 'w') as f:
+            for t in portfolio.trades:
+                f.write(json.dumps(t) + "\n")
+
+        print(f"✅ Backfilled {updated} trades, {failed} failed")
+
+        return web.json_response({
+            "status": "success",
+            "tokens_checked": len(tokens_to_lookup),
+            "trades_updated": updated,
+            "already_ok": already_ok,
+            "failed": failed
+        })
+
     async def resolve_ended_markets(request):
         """Check for resolved markets and close positions with final P&L."""
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -4165,6 +4274,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_post("/purge-unknown", purge_unknown_trades)
     app.router.add_post("/assign-cigarettes", assign_unknown_to_cigarettes)
     app.router.add_post("/purge-orphan-sells", purge_orphan_sells)
+    app.router.add_post("/backfill-markets", backfill_markets)
     app.router.add_post("/resolve", resolve_ended_markets)
     app.router.add_get("/reconcile", reconcile_positions)
     app.router.add_post("/update-prices", trigger_price_update)
