@@ -3585,11 +3585,19 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                     print(f"Error fetching activity for {wallet_name}: {e}")
 
         # Match unknown trades to wallets
+        from datetime import datetime
         for idx, trade in unknown_trades:
             token_id = trade.get("token_id")
-            trade_ts = trade.get("timestamp", "")[:19]  # Truncate to seconds
+            trade_ts_str = trade.get("timestamp", "")[:19]  # Truncate to seconds
             trade_side = trade.get("side", "").upper()
             original_size = trade.get("original_size", 0)
+
+            # Convert trade timestamp to Unix
+            try:
+                trade_dt = datetime.fromisoformat(trade_ts_str.replace("Z", ""))
+                trade_unix = trade_dt.timestamp()
+            except:
+                continue
 
             matched_wallet = None
             best_match_score = 0
@@ -3597,15 +3605,21 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             for wallet_addr, wallet_name in TRACKED_WALLETS.items():
                 token_trades = wallet_activity.get(wallet_addr, {}).get(token_id, [])
                 for wt in token_trades:
-                    wt_ts = wt["timestamp"][:19] if wt.get("timestamp") else ""
+                    # Handle timestamp as int (Unix) or string (ISO)
+                    wt_ts = wt.get("timestamp", 0)
+                    if isinstance(wt_ts, str):
+                        try:
+                            wt_unix = datetime.fromisoformat(wt_ts.replace("Z", "")).timestamp()
+                        except:
+                            continue
+                    else:
+                        wt_unix = float(wt_ts) / 1000 if wt_ts > 1e12 else float(wt_ts)  # Handle ms vs s
+
                     # Match by timestamp proximity and side
                     if wt["side"] == trade_side:
                         # Check timestamp match (within 60 seconds)
                         try:
-                            from datetime import datetime
-                            t1 = datetime.fromisoformat(trade_ts.replace("Z", ""))
-                            t2 = datetime.fromisoformat(wt_ts.replace("Z", ""))
-                            diff = abs((t1 - t2).total_seconds())
+                            diff = abs(trade_unix - wt_unix)
                             if diff < 60:
                                 # Score based on size match and time proximity
                                 size_match = 1 - abs(wt["size"] - original_size) / max(wt["size"], original_size, 1)
