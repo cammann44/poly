@@ -414,6 +414,7 @@ class Portfolio:
         self.start_time = datetime.now()
         self.daily_start_value = STARTING_BALANCE  # For daily loss tracking
         self.trading_paused = False  # Pause on daily loss limit
+        self.daily_reset_date = datetime.now().date()  # Track when we last reset daily metrics
 
         # Per-wallet stats: wallet_name -> {trades, open, closed, pnl, volume, wins, losses}
         self.wallet_stats = {name: {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
@@ -451,6 +452,12 @@ class Portfolio:
         exposure = sum(p["cost"] for p in self.positions.values())
         portfolio_value = self.balance + exposure
         PORTFOLIO_VALUE.set(portfolio_value)
+
+        # Set daily start value to current portfolio value on startup
+        self.daily_start_value = portfolio_value
+        self.trading_paused = False  # Always start with trading enabled
+        print(f"📊 Daily start value set to current portfolio: ${portfolio_value:,.2f}")
+
         REALISED_PNL.set(self.realised_pnl)
         UNREALISED_PNL.set(self.get_unrealised_pnl())  # Will be 0 until prices fetched
         DAILY_VOLUME.set(self.daily_volume)
@@ -673,7 +680,9 @@ class Portfolio:
         # Check portfolio exposure limit for BUYs
         if side == "BUY":
             current_exposure = sum(p["cost"] for p in self.positions.values())
-            max_exposure = STARTING_BALANCE * MAX_PORTFOLIO_EXPOSURE
+            # Use current portfolio value, not fixed starting balance
+            portfolio_value = self.balance + current_exposure
+            max_exposure = portfolio_value * MAX_PORTFOLIO_EXPOSURE
             if current_exposure + copy_size > max_exposure:
                 print(f"  ⚠ Exposure limit: ${current_exposure:.0f} + ${copy_size:.0f} > ${max_exposure:.0f}")
                 copy_size = max(0, max_exposure - current_exposure)
@@ -809,12 +818,26 @@ class Portfolio:
         KILL_SWITCH_ACTIVE.set(1 if check_kill_switch() else 0)
         TRADING_PAUSED.set(1 if self.trading_paused else 0)
 
+        # Check for daily reset (midnight rollover)
+        today = datetime.now().date()
+        if today != self.daily_reset_date:
+            print(f"🌅 Daily reset: new day {today}")
+            self.daily_start_value = portfolio_value  # Start fresh from current value
+            self.trading_paused = False  # Reset pause flag
+            self.daily_reset_date = today
+            self.daily_volume = 0  # Reset daily volume too
+
         # Check daily loss limit
         daily_pnl = portfolio_value - self.daily_start_value
         DAILY_PNL.set(daily_pnl)
         if daily_pnl < -STARTING_BALANCE * DAILY_LOSS_LIMIT:
-            self.trading_paused = True
-            print(f"🚨 DAILY LOSS LIMIT REACHED: ${daily_pnl:+,.2f}")
+            if not self.trading_paused:
+                self.trading_paused = True
+                print(f"🚨 DAILY LOSS LIMIT REACHED: ${daily_pnl:+,.2f}")
+        elif self.trading_paused and daily_pnl >= 0:
+            # Resume trading if we've recovered to break-even or better
+            self.trading_paused = False
+            print(f"✅ Trading resumed - daily P&L recovered: ${daily_pnl:+,.2f}")
 
         # Update performance metrics
         # Track latency (keep last 100)
@@ -2043,6 +2066,27 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "trailing_stop_pct": TRAILING_STOP_LOSS * 100
         })
 
+    async def unpause_trading(request):
+        """Manually unpause trading and reset daily start value."""
+        old_paused = portfolio.trading_paused
+        old_start_value = portfolio.daily_start_value
+
+        # Reset pause flag and update daily start value to current portfolio value
+        portfolio.trading_paused = False
+        pv = portfolio.get_portfolio_value()
+        portfolio.daily_start_value = pv
+        portfolio.daily_reset_date = datetime.now().date()
+
+        print(f"🔓 Trading manually unpaused. Daily start value: ${old_start_value:,.2f} → ${pv:,.2f}")
+
+        return web.json_response({
+            "success": True,
+            "was_paused": old_paused,
+            "old_daily_start_value": round(old_start_value, 2),
+            "new_daily_start_value": round(pv, 2),
+            "message": "Trading unpaused - daily metrics reset to current portfolio value"
+        })
+
     async def get_missed_trades(request):
         """Return missed trades for analysis."""
         # Calculate potential value for each missed trade
@@ -2623,6 +2667,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_get("/categories", get_categories)
     app.router.add_get("/wallets", get_wallets)
     app.router.add_get("/risk", get_risk_status)
+    app.router.add_post("/unpause", unpause_trading)
     app.router.add_get("/missed", get_missed_trades)
     app.router.add_get("/daily", get_daily_pnl)
     app.router.add_get("/debug", debug_positions)
