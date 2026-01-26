@@ -3713,6 +3713,14 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         portfolio.wallet_stats = {}
         open_tokens = set(portfolio.positions.keys())
 
+        # Build map of BUY entry prices by token_id
+        buy_prices = {}
+        for trade in portfolio.trades:
+            if trade.get("side") == "BUY":
+                token_id = trade.get("token_id", "")
+                if token_id and token_id not in buy_prices:
+                    buy_prices[token_id] = trade.get("price", 0)
+
         for trade in portfolio.trades:
             wallet = trade.get("trader") or trade.get("wallet") or "unknown"
             if wallet not in portfolio.wallet_stats:
@@ -3722,9 +3730,16 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
 
             token_id = trade.get("token_id")
             if trade.get("side") == "SELL":
-                # SELL trades are closures
+                # SELL trades are closures - calculate P&L correctly
                 portfolio.wallet_stats[wallet]["closed"] += 1
-                pnl = trade.get("pnl", 0) or trade.get("trade_pnl", 0) or 0
+                exit_price = trade.get("price", 0)
+                entry_price = buy_prices.get(token_id, 0)
+                copy_size = trade.get("copy_size", 0)
+                # pnl = (exit - entry) * shares, where shares = cost / entry_price
+                if entry_price > 0 and copy_size > 0:
+                    pnl = (exit_price - entry_price) * (copy_size / entry_price)
+                else:
+                    pnl = 0
                 portfolio.wallet_stats[wallet]["pnl"] += pnl
                 if pnl >= 0:
                     portfolio.wallet_stats[wallet]["wins"] += 1
@@ -3781,9 +3796,18 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             for t in portfolio.trades:
                 f.write(json.dumps(t) + "\n")
 
-        # Rebuild wallet_stats
+        # Rebuild wallet_stats with correct P&L calculation
         portfolio.wallet_stats = {}
         open_tokens = set(portfolio.positions.keys())
+
+        # Build map of BUY entry prices by token_id
+        buy_prices = {}
+        for trade in portfolio.trades:
+            if trade.get("side") == "BUY":
+                token_id = trade.get("token_id", "")
+                if token_id and token_id not in buy_prices:
+                    buy_prices[token_id] = trade.get("price", 0)
+
         for trade in portfolio.trades:
             wallet = trade.get("trader") or trade.get("wallet") or "unknown"
             if wallet not in portfolio.wallet_stats:
@@ -3793,7 +3817,13 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             token_id = trade.get("token_id")
             if trade.get("side") == "SELL":
                 portfolio.wallet_stats[wallet]["closed"] += 1
-                pnl = trade.get("pnl", 0) or trade.get("trade_pnl", 0) or 0
+                exit_price = trade.get("price", 0)
+                entry_price = buy_prices.get(token_id, 0)
+                copy_size = trade.get("copy_size", 0)
+                if entry_price > 0 and copy_size > 0:
+                    pnl = (exit_price - entry_price) * (copy_size / entry_price)
+                else:
+                    pnl = 0
                 portfolio.wallet_stats[wallet]["pnl"] += pnl
                 if pnl >= 0:
                     portfolio.wallet_stats[wallet]["wins"] += 1
