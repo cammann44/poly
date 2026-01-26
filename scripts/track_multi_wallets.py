@@ -4001,6 +4001,31 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "wallet_totals": {w: round(s["pnl"], 2) for w, s in portfolio.wallet_stats.items()}
         })
 
+    async def fix_realised(request):
+        """Fix realised P&L based on actual capital change from starting balance."""
+        STARTING_BALANCE = 200000.0
+
+        # Calculate actual capital (cash + exposure)
+        exposure = sum(p.get("cost", 0) for p in portfolio.positions.values())
+        actual_capital = portfolio.balance + exposure
+
+        # Realised = capital gained from starting
+        correct_realised = actual_capital - STARTING_BALANCE
+
+        old_realised = portfolio.realised_pnl
+        portfolio.realised_pnl = correct_realised
+        REALISED_PNL.set(correct_realised)
+
+        return web.json_response({
+            "status": "success",
+            "starting_balance": STARTING_BALANCE,
+            "current_balance": round(portfolio.balance, 2),
+            "exposure": round(exposure, 2),
+            "actual_capital": round(actual_capital, 2),
+            "old_realised_pnl": round(old_realised, 2),
+            "new_realised_pnl": round(correct_realised, 2)
+        })
+
     async def backfill_markets(request):
         """Backfill missing market names by looking up token_ids in Polymarket API."""
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -4469,6 +4494,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_post("/purge-orphan-sells", purge_orphan_sells)
     app.router.add_post("/purge-bad-trades", purge_bad_trades)
     app.router.add_post("/recalc-all", recalc_all)
+    app.router.add_post("/fix-realised", fix_realised)
     app.router.add_post("/backfill-markets", backfill_markets)
     app.router.add_post("/resolve", resolve_ended_markets)
     app.router.add_get("/reconcile", reconcile_positions)
