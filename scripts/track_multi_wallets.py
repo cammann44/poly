@@ -3839,6 +3839,93 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "remaining": len(portfolio.trades)
         })
 
+    async def purge_bad_trades(request):
+        """Remove trades with suspicious data: size > $500, unresolved markets, pnl_ratio > 100x."""
+        original_count = len(portfolio.trades)
+        kept_trades = []
+        removed = 0
+        reasons = {"large_size": 0, "unresolved_market": 0, "high_pnl_ratio": 0}
+
+        for trade in portfolio.trades:
+            size = trade.get("copy_size", 0) or trade.get("size", 0) or 0
+            market = trade.get("market", "")
+
+            # Calculate P&L ratio
+            entry = trade.get("price", 0)
+            if trade.get("side") == "SELL" and entry > 0 and size > 0:
+                exit_price = trade.get("price", 0)
+                # Find entry price from positions or use stored
+                pnl = abs((exit_price - entry) * (size / entry)) if entry > 0 else 0
+                pnl_ratio = pnl / size if size > 0 else 0
+            else:
+                pnl_ratio = 0
+
+            # Check for bad data
+            is_bad = False
+            if size > 500:
+                reasons["large_size"] += 1
+                is_bad = True
+            elif market.startswith("Token "):
+                reasons["unresolved_market"] += 1
+                is_bad = True
+            elif pnl_ratio > 100:
+                reasons["high_pnl_ratio"] += 1
+                is_bad = True
+
+            if is_bad:
+                removed += 1
+            else:
+                kept_trades.append(trade)
+
+        portfolio.trades = kept_trades
+
+        # Save and rebuild stats
+        with open(LOG_FILE, 'w') as f:
+            for t in portfolio.trades:
+                f.write(json.dumps(t) + "\n")
+
+        # Rebuild wallet_stats
+        portfolio.wallet_stats = {}
+        open_tokens = set(portfolio.positions.keys())
+        buy_prices = {}
+        for trade in portfolio.trades:
+            if trade.get("side") == "BUY":
+                token_id = trade.get("token_id", "")
+                if token_id and token_id not in buy_prices:
+                    buy_prices[token_id] = trade.get("price", 0)
+
+        for trade in portfolio.trades:
+            wallet = trade.get("trader") or trade.get("wallet") or "unknown"
+            if wallet not in portfolio.wallet_stats:
+                portfolio.wallet_stats[wallet] = {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
+            portfolio.wallet_stats[wallet]["trades"] += 1
+            portfolio.wallet_stats[wallet]["volume"] += trade.get("copy_size", 0)
+            token_id = trade.get("token_id")
+            if trade.get("side") == "SELL":
+                portfolio.wallet_stats[wallet]["closed"] += 1
+                exit_price = trade.get("price", 0)
+                entry_price = buy_prices.get(token_id, 0)
+                copy_size = trade.get("copy_size", 0)
+                if entry_price > 0 and copy_size > 0:
+                    pnl = (exit_price - entry_price) * (copy_size / entry_price)
+                else:
+                    pnl = 0
+                portfolio.wallet_stats[wallet]["pnl"] += pnl
+                if pnl >= 0:
+                    portfolio.wallet_stats[wallet]["wins"] += 1
+                else:
+                    portfolio.wallet_stats[wallet]["losses"] += 1
+            elif token_id in open_tokens:
+                portfolio.wallet_stats[wallet]["open"] += 1
+
+        return web.json_response({
+            "status": "success",
+            "original_trades": original_count,
+            "removed": removed,
+            "reasons": reasons,
+            "remaining": len(portfolio.trades)
+        })
+
     async def backfill_markets(request):
         """Backfill missing market names by looking up token_ids in Polymarket API."""
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -4305,6 +4392,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_post("/purge-unknown", purge_unknown_trades)
     app.router.add_post("/assign-cigarettes", assign_unknown_to_cigarettes)
     app.router.add_post("/purge-orphan-sells", purge_orphan_sells)
+    app.router.add_post("/purge-bad-trades", purge_bad_trades)
     app.router.add_post("/backfill-markets", backfill_markets)
     app.router.add_post("/resolve", resolve_ended_markets)
     app.router.add_get("/reconcile", reconcile_positions)
