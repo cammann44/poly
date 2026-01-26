@@ -3926,6 +3926,81 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "remaining": len(portfolio.trades)
         })
 
+    async def recalc_all(request):
+        """Recalculate all P&L values from trade data using correct formula."""
+        # Build map of BUY entry prices by token_id
+        buy_prices = {}
+        for trade in portfolio.trades:
+            if trade.get("side") == "BUY":
+                token_id = trade.get("token_id", "")
+                price = trade.get("price", 0)
+                if token_id and price > 0:
+                    if token_id not in buy_prices:
+                        buy_prices[token_id] = price
+
+        # Recalculate realised P&L from SELL trades
+        total_realised = 0.0
+        open_tokens = set(portfolio.positions.keys())
+
+        # Rebuild wallet_stats
+        portfolio.wallet_stats = {}
+
+        for trade in portfolio.trades:
+            wallet = trade.get("trader") or trade.get("wallet") or "unknown"
+            if wallet not in portfolio.wallet_stats:
+                portfolio.wallet_stats[wallet] = {"trades": 0, "open": 0, "closed": 0, "pnl": 0.0, "volume": 0.0, "wins": 0, "losses": 0}
+
+            portfolio.wallet_stats[wallet]["trades"] += 1
+            copy_size = trade.get("copy_size", 0)
+            portfolio.wallet_stats[wallet]["volume"] += copy_size
+
+            token_id = trade.get("token_id")
+            side = trade.get("side")
+
+            if side == "SELL":
+                portfolio.wallet_stats[wallet]["closed"] += 1
+                exit_price = trade.get("price", 0)
+                entry_price = buy_prices.get(token_id, 0)
+
+                # Calculate P&L: (exit - entry) * shares, where shares = cost / entry
+                if entry_price > 0 and copy_size > 0:
+                    pnl = (exit_price - entry_price) * (copy_size / entry_price)
+                else:
+                    pnl = 0
+
+                # Cap P&L at reasonable bounds (max 100x gain, max -100% loss)
+                if copy_size > 0:
+                    if pnl > copy_size * 100:
+                        pnl = copy_size * 100  # Cap at 100x
+                    if pnl < -copy_size:
+                        pnl = -copy_size  # Can't lose more than invested
+
+                portfolio.wallet_stats[wallet]["pnl"] += pnl
+                total_realised += pnl
+
+                if pnl >= 0:
+                    portfolio.wallet_stats[wallet]["wins"] += 1
+                else:
+                    portfolio.wallet_stats[wallet]["losses"] += 1
+
+            elif side == "BUY" and token_id in open_tokens:
+                portfolio.wallet_stats[wallet]["open"] += 1
+
+        # Update portfolio realised P&L
+        old_realised = portfolio.realised_pnl
+        portfolio.realised_pnl = total_realised
+
+        # Update Prometheus metric
+        REALISED_PNL.set(total_realised)
+
+        return web.json_response({
+            "status": "success",
+            "old_realised_pnl": round(old_realised, 2),
+            "new_realised_pnl": round(total_realised, 2),
+            "wallets_rebuilt": len(portfolio.wallet_stats),
+            "wallet_totals": {w: round(s["pnl"], 2) for w, s in portfolio.wallet_stats.items()}
+        })
+
     async def backfill_markets(request):
         """Backfill missing market names by looking up token_ids in Polymarket API."""
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -4393,6 +4468,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_post("/assign-cigarettes", assign_unknown_to_cigarettes)
     app.router.add_post("/purge-orphan-sells", purge_orphan_sells)
     app.router.add_post("/purge-bad-trades", purge_bad_trades)
+    app.router.add_post("/recalc-all", recalc_all)
     app.router.add_post("/backfill-markets", backfill_markets)
     app.router.add_post("/resolve", resolve_ended_markets)
     app.router.add_get("/reconcile", reconcile_positions)
