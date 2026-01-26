@@ -2792,8 +2792,9 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                         outcome = buy_info.get("outcome")
 
                 # Calculate P&L for SELL
+                # shares = cost / entry_price, pnl = (exit - entry) * shares
                 if entry_price and entry_price > 0 and exit_price:
-                    pnl = (exit_price - entry_price) * (copy_size / exit_price) if exit_price > 0 else 0
+                    pnl = (exit_price - entry_price) * (copy_size / entry_price)
                     pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                 else:
                     pnl = trade.get("trade_pnl", 0) or 0.0
