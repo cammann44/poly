@@ -5,6 +5,6 @@ global:
 scrape_configs:
   - job_name: 'polymarket-tracker'
     static_configs:
-      - targets: ['tracker-production-e869.up.railway.app']
+      - targets: ['real-trader-production.up.railway.app']
     scheme: https
     metrics_path: /prometheus
