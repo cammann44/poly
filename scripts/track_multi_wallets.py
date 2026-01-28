@@ -4626,6 +4626,24 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     app.router.add_get("/withdrawal", get_withdrawal_status)
     app.router.add_post("/withdrawal/trigger", trigger_withdrawal)
 
+    async def unpause_trading(request):
+        """Reset daily P&L and unpause trading."""
+        pv = portfolio.get_portfolio_value()
+        old_start = portfolio.daily_start_value
+        portfolio.daily_start_value = pv
+        portfolio.trading_paused = False
+        portfolio.paused_since = None
+        portfolio._save_state()
+        return web.json_response({
+            "status": "unpaused",
+            "old_daily_start": round(old_start, 2),
+            "new_daily_start": round(pv, 2),
+            "portfolio_value": round(pv, 2),
+            "trading_paused": False
+        })
+    app.router.add_post("/unpause", unpause_trading)
+    app.router.add_get("/unpause", unpause_trading)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 9092)
