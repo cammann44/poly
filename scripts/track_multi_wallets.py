@@ -4498,6 +4498,12 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
             "log_file": str(LOG_FILE),
             "state_file": str(STATE_FILE),
             "volume_mounted": VOLUME_PATH.exists(),
+            "real_trading": {
+                "enabled": REAL_TRADING_ENABLED,
+                "clob_client_ready": clob_client is not None,
+                "bet_size": REAL_BET_SIZE if REAL_TRADING_ENABLED else 0,
+                "proxy_wallet": POLY_PROXY_WALLET[:10] + "..." if POLY_PROXY_WALLET else None
+            },
             "checks": {
                 "api_polling": api_healthy,
                 "log_writable": LOG_FILE.parent.exists(),
