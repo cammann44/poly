@@ -1,15 +1,17 @@
 # Prometheus configuration for Polymarket Copy-Trading Bot
+# Railway deployment - scrapes real-trader service
 
 global:
-  scrape_interval: 5s
-  evaluation_interval: 5s
+  scrape_interval: 15s
+  evaluation_interval: 15s
 
 scrape_configs:
-  # Tracker metrics (runs on WSL host)
-  - job_name: 'tracker'
+  # Real trading tracker metrics
+  - job_name: 'polymarket-tracker'
+    scheme: https
     static_configs:
-      - targets: ['172.29.218.131:9091']
-    metrics_path: '/metrics'
+      - targets: ['real-trader-production.up.railway.app']
+    metrics_path: '/prometheus'
 
   # Prometheus self-monitoring
   - job_name: 'prometheus'
