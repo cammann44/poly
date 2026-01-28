@@ -1,9 +1,7 @@
 aiohttp>=3.9.0
 websockets>=12.0
 prometheus_client>=0.19.0
-web3>=6.0.0,<7.0.0
-eth-account>=0.11.0,<0.13.0
 requests>=2.31.0
 psycopg2-binary>=2.9.9
 py-clob-client>=0.34.0
-# cache bust 2026-01-28-v2
+# cache bust 2026-01-28-v3
