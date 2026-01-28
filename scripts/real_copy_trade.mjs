@@ -9,8 +9,28 @@ console.log("Time:", new Date().toISOString());
 
 import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
 import { Wallet } from "ethers";
+import { createServer } from "http";
 
 console.log("Dependencies loaded");
+
+// Health check server for Railway
+const PORT = process.env.PORT || 9092;
+const server = createServer((req, res) => {
+  if (req.url === "/health" || req.url === "/") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      status: "running",
+      dailyTrades,
+      dailyPnL,
+      seenTrades: seenTrades.size,
+      uptime: process.uptime()
+    }));
+  } else {
+    res.writeHead(404);
+    res.end("Not found");
+  }
+});
+server.listen(PORT, () => console.log(`Health server on port ${PORT}`));
 
 const HOST = "https://clob.polymarket.com";
 const CHAIN_ID = 137;
