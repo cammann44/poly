@@ -29,3 +29,4 @@ node_modules/
 .DS_Store
 Thumbs.db
 key.txt
+.env.real

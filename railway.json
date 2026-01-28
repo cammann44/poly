@@ -5,9 +5,8 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "startCommand": "python track_multi_wallets.py",
-    "healthcheckPath": "/summary",
-    "healthcheckTimeout": 30,
-    "restartPolicyType": "ON_FAILURE"
+    "startCommand": "node real_copy_trade.mjs",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
   }
 }
