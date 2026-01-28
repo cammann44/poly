@@ -1,24 +1,28 @@
+# PYTHON TRACKER v8 - REAL TRADING SUPPORT
 FROM python:3.12-slim
+
+# Unique build marker to invalidate cache
+ARG BUILD_DATE=unknown
+RUN echo "Build: ${BUILD_DATE}" > /build-marker
 
 WORKDIR /app
 
-# Force cache invalidation - v7 real trading
-COPY .build-version /tmp/.build-version 2>/dev/null || true
-
-# Install dependencies
+# Install Python dependencies first
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
-COPY scripts/track_multi_wallets.py .
-RUN echo "Build timestamp: $(date)" > /app/.buildinfo
+# Copy wallet config
 COPY config/ ./config/
 
-# Copy trade history for state restore (if exists)
-COPY logs/poly_trades.json ./logs/ 2>/dev/null || true
+# Copy main tracker script
+COPY scripts/track_multi_wallets.py .
 
-# Expose ports (metrics + health)
+# Create logs directory
+RUN mkdir -p logs
+
+# Health and metrics ports
 EXPOSE 9091 9092
 
-# Run tracker with real trading support
-CMD ["python", "track_multi_wallets.py"]
+# Start Python tracker
+ENTRYPOINT ["python"]
+CMD ["track_multi_wallets.py"]
