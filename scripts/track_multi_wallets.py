@@ -1373,10 +1373,14 @@ class Portfolio:
                     signed_order = clob_client.create_order(order_args)
                     resp = clob_client.post_order(signed_order, OrderType.GTC)
                     real_order_id = resp.get("orderID") if isinstance(resp, dict) else None
+                    self._real_orders_ok = getattr(self, '_real_orders_ok', 0) + 1
                     print(f"  💰 REAL ORDER: {side} {real_size} @ {price} = ${REAL_BET_SIZE:.2f} | ID: {real_order_id}")
                 else:
+                    self._real_orders_skipped = getattr(self, '_real_orders_skipped', 0) + 1
                     print(f"  ⚠ Real trade skipped - size too small at price {price}")
             except Exception as e:
+                self._real_orders_failed = getattr(self, '_real_orders_failed', 0) + 1
+                self._real_last_error = str(e)[:200]
                 print(f"  ❌ Real order failed: {e}")
                 # Continue with paper trade even if real fails
 
@@ -4494,7 +4498,11 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 "enabled": REAL_TRADING_ENABLED,
                 "clob_client_ready": clob_client is not None,
                 "bet_size": REAL_BET_SIZE if REAL_TRADING_ENABLED else 0,
-                "proxy_wallet": POLY_PROXY_WALLET[:10] + "..." if POLY_PROXY_WALLET else None
+                "proxy_wallet": POLY_PROXY_WALLET[:10] + "..." if POLY_PROXY_WALLET else None,
+                "orders_ok": getattr(portfolio, '_real_orders_ok', 0),
+                "orders_failed": getattr(portfolio, '_real_orders_failed', 0),
+                "orders_skipped": getattr(portfolio, '_real_orders_skipped', 0),
+                "last_error": getattr(portfolio, '_real_last_error', None)
             },
             "checks": {
                 "api_polling": api_healthy,
