@@ -1,24 +1,16 @@
-FROM python:3.12-slim
+FROM node:20-slim
 
 WORKDIR /app
 
-# Force cache invalidation - v6
-COPY .build-version /tmp/.build-version
-
 # Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY package*.json ./
+RUN npm install --production
 
-# Copy application with unrealised_pnl fix
-COPY scripts/track_multi_wallets.py .
-RUN echo "Build timestamp: $(date)" > /app/.buildinfo
-COPY config/ ./config/
+# Copy real trading bot
+COPY scripts/real_copy_trade.mjs ./
 
-# Copy trade history for state restore
-COPY logs/poly_trades.json ./logs/
+# Environment variables set in Railway
+ENV NODE_ENV=production
 
-# Expose ports
-EXPOSE 9091 9092
-
-# Run tracker
-CMD ["python", "track_multi_wallets.py"]
+# Run real trading bot
+CMD ["node", "real_copy_trade.mjs"]
