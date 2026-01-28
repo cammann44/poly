@@ -78,6 +78,7 @@ MIN_COPY_SIZE = 10  # Min $10 per trade
 # ============== RISK CONTROLS ==============
 MAX_PORTFOLIO_EXPOSURE = 1.0  # Max 100% of capital in positions
 TRAILING_STOP_LOSS = 0.20  # Exit if position drops 20% from peak
+TAKE_PROFIT_DOLLARS = 3000  # Exit if position P&L >= $3,000
 DAILY_LOSS_LIMIT = 0.10  # Stop trading if daily loss exceeds 10%
 MIN_WALLET_WIN_RATE = 0.40  # Reduce copy ratio if wallet win rate < 40%
 
@@ -98,6 +99,42 @@ MIN_BALANCE_KEEP = float(os.environ.get("MIN_BALANCE_KEEP", "5000"))  # Always k
 WITHDRAWAL_CHECK_INTERVAL = 3600  # Check every hour (seconds)
 USDC_CONTRACT_POLYGON = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"  # USDC on Polygon
 USDC_DECIMALS = 6
+
+# ============== REAL TRADING CONFIG ==============
+REAL_TRADING_ENABLED = os.environ.get("REAL_TRADING_ENABLED", "false").lower() in ["1", "true", "yes"]
+POLY_PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "")  # Magic wallet private key
+POLY_PROXY_WALLET = os.environ.get("POLY_PROXY_WALLET", "")  # Proxy wallet address
+REAL_BET_SIZE = float(os.environ.get("REAL_BET_SIZE", "2"))  # Fixed bet size for real trading
+CLOB_HOST = "https://clob.polymarket.com"
+POLYGON_CHAIN_ID = 137
+
+# Initialize CLOB client for real trading
+clob_client = None
+if REAL_TRADING_ENABLED and POLY_PRIVATE_KEY and POLY_PROXY_WALLET:
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds
+        from eth_account import Account as EthAccount
+
+        _signer = EthAccount.from_key(POLY_PRIVATE_KEY)
+        _init_client = ClobClient(CLOB_HOST, key=POLY_PRIVATE_KEY, chain_id=POLYGON_CHAIN_ID)
+        _creds = _init_client.create_or_derive_api_creds()
+
+        clob_client = ClobClient(
+            CLOB_HOST,
+            key=POLY_PRIVATE_KEY,
+            chain_id=POLYGON_CHAIN_ID,
+            creds=_creds,
+            signature_type=1,  # POLY_PROXY
+            funder=POLY_PROXY_WALLET
+        )
+        print(f"✅ Real trading enabled - Owner: {_signer.address}, Proxy: {POLY_PROXY_WALLET}")
+    except Exception as e:
+        print(f"⚠ Failed to init CLOB client: {e}")
+        REAL_TRADING_ENABLED = False
+elif REAL_TRADING_ENABLED:
+    print("⚠ Real trading requested but missing POLY_PRIVATE_KEY or POLY_PROXY_WALLET")
+    REAL_TRADING_ENABLED = False
 
 def check_kill_switch() -> bool:
     """Check if kill switch is active. Returns True if trading should STOP."""
@@ -1319,6 +1356,38 @@ class Portfolio:
         fee = copy_size * 0.001
         trade_pnl = 0.0
 
+        # === REAL TRADING ===
+        real_order_id = None
+        if REAL_TRADING_ENABLED and clob_client and not is_backfill:
+            try:
+                from py_clob_client.order_builder.constants import BUY, SELL
+                real_size = int(REAL_BET_SIZE / price) if price > 0 else 0
+                if real_size >= 1:
+                    order_args = {
+                        "token_id": token_id,
+                        "price": price,
+                        "size": real_size,
+                        "side": BUY if side == "BUY" else SELL,
+                    }
+                    # Get market tick size
+                    try:
+                        market_info = clob_client.get_market(token_id)
+                        tick_size = market_info.get("minimum_tick_size", "0.01")
+                        neg_risk = market_info.get("neg_risk", False)
+                    except:
+                        tick_size = "0.01"
+                        neg_risk = False
+
+                    signed_order = clob_client.create_order(order_args)
+                    resp = clob_client.post_order(signed_order, tick_size=tick_size, neg_risk=neg_risk)
+                    real_order_id = resp.get("orderID")
+                    print(f"  💰 REAL ORDER: {side} {real_size} @ {price} = ${REAL_BET_SIZE:.2f} | ID: {real_order_id}")
+                else:
+                    print(f"  ⚠ Real trade skipped - size too small at price {price}")
+            except Exception as e:
+                print(f"  ❌ Real order failed: {e}")
+                # Continue with paper trade even if real fails
+
         if side == "BUY":
             cost = copy_size + fee
             if cost > self.balance:
@@ -1610,6 +1679,29 @@ class Portfolio:
                     "drawdown": drawdown,
                     "peak": peak,
                     "current_price": current_price
+                })
+        return triggers
+
+    def check_take_profits(self) -> list:
+        """Check positions for take-profit triggers ($3k+ gain)."""
+        triggers = []
+        for token_id, pos in list(self.positions.items()):
+            current_price = self.position_prices.get(token_id)
+            if not current_price:
+                continue
+            entry_price = pos.get("entry_price", 0)
+            shares = pos.get("size", 0)
+            if entry_price <= 0 or shares <= 0:
+                continue
+            pnl = (current_price - entry_price) * shares
+            if pnl >= TAKE_PROFIT_DOLLARS:
+                triggers.append({
+                    "token_id": token_id,
+                    "market": pos.get("market", "Unknown"),
+                    "pnl": pnl,
+                    "entry_price": entry_price,
+                    "current_price": current_price,
+                    "shares": shares
                 })
         return triggers
 
@@ -2472,7 +2564,15 @@ class MultiWalletTracker:
                     token_id = trigger["token_id"]
                     price = trigger["current_price"]
                     print(f"🚨 Trailing stop-loss triggered for {trigger['market']} (drawdown {trigger['drawdown']:.1%})")
-                    self.portfolio.force_close_position(token_id, price)
+                    self.portfolio.force_close_position(token_id, price, reason="trailing_stop_loss")
+
+                # Check take-profit triggers
+                tp_triggers = self.portfolio.check_take_profits()
+                for trigger in tp_triggers:
+                    token_id = trigger["token_id"]
+                    price = trigger["current_price"]
+                    print(f"💰 Take-profit triggered for {trigger['market']} (P&L: ${trigger['pnl']:,.2f}, entry: {trigger['entry_price']:.4f} → {price:.4f})")
+                    self.portfolio.force_close_position(token_id, price, reason="take_profit")
 
                 # Update metrics with live prices
                 unrealised = self.portfolio.get_unrealised_pnl()
@@ -2706,6 +2806,19 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
     """Run a simple HTTP API to serve trade data for Grafana."""
     from aiohttp import web
 
+    @web.middleware
+    async def cors_middleware(request, handler):
+        """Add CORS headers to all responses."""
+        if request.method == "OPTIONS":
+            # Handle preflight requests
+            response = web.Response()
+        else:
+            response = await handler(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        return response
+
     async def get_trades(request):
         """Return all trades as JSON."""
         return web.json_response(portfolio.trades)
@@ -2792,9 +2905,11 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                         outcome = buy_info.get("outcome")
 
                 # Calculate P&L for SELL
-                # shares = cost / entry_price, pnl = (exit - entry) * shares
+                # For SELL trades, copy_size is already SHARES (not dollars)
+                # pnl = (exit - entry) * shares
                 if entry_price and entry_price > 0 and exit_price:
-                    pnl = (exit_price - entry_price) * (copy_size / entry_price)
+                    shares = copy_size  # SELL trades have shares in copy_size
+                    pnl = (exit_price - entry_price) * shares
                     pnl_pct = ((exit_price - entry_price) / entry_price) * 100
                 else:
                     pnl = trade.get("trade_pnl", 0) or 0.0
@@ -2951,7 +3066,12 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
 
             # Calculate P&L
             if entry_price and current_price and entry_price > 0:
-                pnl = (current_price - entry_price) * (copy_size / entry_price)
+                # For SELL trades, copy_size is shares; for BUY, it's dollars
+                if side == "SELL":
+                    shares = copy_size  # SELL has shares
+                else:
+                    shares = copy_size / entry_price  # BUY has dollars, convert to shares
+                pnl = (current_price - entry_price) * shares
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100
             else:
                 pnl = 0
@@ -3735,9 +3855,11 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 exit_price = trade.get("price", 0)
                 entry_price = buy_prices.get(token_id, 0)
                 copy_size = trade.get("copy_size", 0)
-                # pnl = (exit - entry) * shares, where shares = cost / entry_price
-                if entry_price > 0 and copy_size > 0:
-                    pnl = (exit_price - entry_price) * (copy_size / entry_price)
+                # For SELL trades, copy_size is SHARES (not dollars)
+                # pnl = (exit - entry) * shares
+                shares = copy_size
+                if entry_price > 0 and shares > 0:
+                    pnl = (exit_price - entry_price) * shares
                 else:
                     pnl = 0
                 portfolio.wallet_stats[wallet]["pnl"] += pnl
@@ -3819,9 +3941,9 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 portfolio.wallet_stats[wallet]["closed"] += 1
                 exit_price = trade.get("price", 0)
                 entry_price = buy_prices.get(token_id, 0)
-                copy_size = trade.get("copy_size", 0)
-                if entry_price > 0 and copy_size > 0:
-                    pnl = (exit_price - entry_price) * (copy_size / entry_price)
+                shares = trade.get("copy_size", 0)  # SELL trades have shares in copy_size
+                if entry_price > 0 and shares > 0:
+                    pnl = (exit_price - entry_price) * shares
                 else:
                     pnl = 0
                 portfolio.wallet_stats[wallet]["pnl"] += pnl
@@ -3905,9 +4027,9 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 portfolio.wallet_stats[wallet]["closed"] += 1
                 exit_price = trade.get("price", 0)
                 entry_price = buy_prices.get(token_id, 0)
-                copy_size = trade.get("copy_size", 0)
-                if entry_price > 0 and copy_size > 0:
-                    pnl = (exit_price - entry_price) * (copy_size / entry_price)
+                shares = trade.get("copy_size", 0)  # SELL trades have shares in copy_size
+                if entry_price > 0 and shares > 0:
+                    pnl = (exit_price - entry_price) * shares
                 else:
                     pnl = 0
                 portfolio.wallet_stats[wallet]["pnl"] += pnl
@@ -3962,18 +4084,22 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
                 exit_price = trade.get("price", 0)
                 entry_price = buy_prices.get(token_id, 0)
 
-                # Calculate P&L: (exit - entry) * shares, where shares = cost / entry
-                if entry_price > 0 and copy_size > 0:
-                    pnl = (exit_price - entry_price) * (copy_size / entry_price)
+                # For SELL trades, copy_size is already SHARES (not dollars)
+                # P&L = (exit_price - entry_price) * shares
+                shares = copy_size  # copy_size for SELLs is shares
+                if entry_price > 0 and shares > 0:
+                    pnl = (exit_price - entry_price) * shares
+                    cost = shares * entry_price  # Original cost in dollars
                 else:
                     pnl = 0
+                    cost = 0
 
-                # Cap P&L at reasonable bounds (max 100x gain, max -100% loss)
-                if copy_size > 0:
-                    if pnl > copy_size * 100:
-                        pnl = copy_size * 100  # Cap at 100x
-                    if pnl < -copy_size:
-                        pnl = -copy_size  # Can't lose more than invested
+                # Cap P&L at reasonable bounds based on cost
+                if cost > 0:
+                    if pnl > cost * 10:  # Max 10x gain (1000%)
+                        pnl = cost * 10
+                    if pnl < -cost:  # Can't lose more than invested
+                        pnl = -cost
 
                 portfolio.wallet_stats[wallet]["pnl"] += pnl
                 total_realised += pnl
@@ -4465,7 +4591,7 @@ async def run_trades_api(portfolio: Portfolio, auto_withdrawal: AutoWithdrawal =
         result = await auto_withdrawal.check_and_withdraw(portfolio.realised_pnl)
         return web.json_response(result)
 
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/", get_root)
     app.router.add_get("/health", get_health)
     app.router.add_get("/errors", get_errors)

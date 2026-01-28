@@ -1,16 +1,24 @@
-FROM node:20-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
+# Force cache invalidation - v7 real trading
+COPY .build-version /tmp/.build-version 2>/dev/null || true
+
 # Install dependencies
-COPY package*.json ./
-RUN npm install --production
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy real trading bot
-COPY scripts/real_copy_trade.mjs ./
+# Copy application
+COPY scripts/track_multi_wallets.py .
+RUN echo "Build timestamp: $(date)" > /app/.buildinfo
+COPY config/ ./config/
 
-# Environment variables set in Railway
-ENV NODE_ENV=production
+# Copy trade history for state restore (if exists)
+COPY logs/poly_trades.json ./logs/ 2>/dev/null || true
 
-# Run real trading bot
-CMD ["node", "real_copy_trade.mjs"]
+# Expose ports (metrics + health)
+EXPOSE 9091 9092
+
+# Run tracker with real trading support
+CMD ["python", "track_multi_wallets.py"]
