@@ -1360,27 +1360,19 @@ class Portfolio:
         real_order_id = None
         if REAL_TRADING_ENABLED and clob_client and not is_backfill:
             try:
+                from py_clob_client.clob_types import OrderArgs, OrderType
                 from py_clob_client.order_builder.constants import BUY, SELL
                 real_size = int(REAL_BET_SIZE / price) if price > 0 else 0
                 if real_size >= 1:
-                    order_args = {
-                        "token_id": token_id,
-                        "price": price,
-                        "size": real_size,
-                        "side": BUY if side == "BUY" else SELL,
-                    }
-                    # Get market tick size
-                    try:
-                        market_info = clob_client.get_market(token_id)
-                        tick_size = market_info.get("minimum_tick_size", "0.01")
-                        neg_risk = market_info.get("neg_risk", False)
-                    except:
-                        tick_size = "0.01"
-                        neg_risk = False
-
+                    order_args = OrderArgs(
+                        token_id=token_id,
+                        price=price,
+                        size=float(real_size),
+                        side=BUY if side == "BUY" else SELL,
+                    )
                     signed_order = clob_client.create_order(order_args)
-                    resp = clob_client.post_order(signed_order, tick_size=tick_size, neg_risk=neg_risk)
-                    real_order_id = resp.get("orderID")
+                    resp = clob_client.post_order(signed_order, OrderType.GTC)
+                    real_order_id = resp.get("orderID") if isinstance(resp, dict) else None
                     print(f"  💰 REAL ORDER: {side} {real_size} @ {price} = ${REAL_BET_SIZE:.2f} | ID: {real_order_id}")
                 else:
                     print(f"  ⚠ Real trade skipped - size too small at price {price}")
