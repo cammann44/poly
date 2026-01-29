@@ -38,8 +38,9 @@ const DATA_API = "https://data-api.polymarket.com";
 const GAMMA_API = "https://gamma-api.polymarket.com";
 
 // Config from environment (for Railway) or defaults
-const PRIVATE_KEY = process.env.POLY_PRIVATE_KEY || "***REDACTED_COMPROMISED_KEY***";
-const PROXY_WALLET = process.env.POLY_PROXY_WALLET || "0x80d96106879899b5fb2f7e232dc16cbb1215550c";
+const PRIVATE_KEY = process.env.POLY_PRIVATE_KEY;
+const PROXY_WALLET = process.env.POLY_PROXY_WALLET;
+if (!PRIVATE_KEY || !PROXY_WALLET) { console.error("FATAL: Set POLY_PRIVATE_KEY and POLY_PROXY_WALLET env vars"); process.exit(1); }
 const TARGET_WALLET = process.env.TARGET_WALLET || "0xd218e474776403a330142299f7796e8ba32eb5c9"; // cigarettes
 const BET_SIZE = parseFloat(process.env.BET_SIZE || "2"); // $2 per trade
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || "15000"); // 15 seconds
